@@ -1,3 +1,6 @@
+#ifdef ESP_PLATFORM
+#include "esp_memory_utils.h"
+#endif
 #include <psyz.h>
 #ifdef ESP_PLATFORM
 #include "esp_attr.h"
@@ -329,11 +332,11 @@ int Psyz_GpuExeque() {
 // A corrupt chain link must not walk the parser into unmapped space: prims
 // legitimately live in PSRAM (game buffers) or internal DRAM statics.
 static inline int prim_ptr_ok(const void* p) {
-    // mapped windows only: flash-rodata + the 8MB PSRAM (ends ~0x3C830000)
-    // and internal DRAM statics; anything else MMU-faults on access
-    uintptr_t a = (uintptr_t)p;
-    return (a >= 0x3C000000u && a < 0x3C830000u) ||
-           (a >= 0x3FC80000u && a < 0x3FD00000u);
+    // mapped windows only: external RAM (game buffers, and the flash rodata
+    // when it runs XIP from PSRAM) and internal DRAM statics; anything else
+    // faults on access. The windows differ per chip (ESP32-S3: 0x3C000000 /
+    // 0x3FC80000, ESP32-P4: 0x48000000 / 0x4FF00000), so ask the SoC layer.
+    return esp_ptr_external_ram(p) || esp_ptr_in_dram(p);
 }
 #else
 #define prim_ptr_ok(p) 1
