@@ -261,7 +261,11 @@ void Psyz_SpuWrite(unsigned int reg_offset, unsigned short value) {
     _spu_RXX->raw[reg_offset >> 1] = value;
     // MSVC's C-mode offsetof is not an integer constant expression, so it
     // cannot appear in a case label. Use an if-chain instead.
-    if (reg_offset == offsetof(SPU_RXX, key_on[0])) { // voices 0..15
+    if (reg_offset == offsetof(SPU_RXX, spucnt)) {
+        if (!(value & SPU_CTRL_MASK_IRQ9_ENABLE)) { // acknowledge
+            _spu_RXX->rxx.spustat &= ~(1u << 6);
+        }
+    } else if (reg_offset == offsetof(SPU_RXX, key_on[0])) { // voices 0..15
         for (int v = 0; v < 16; v++) {
             if (value & (1u << v))
                 spu_key_on_voice(v);
@@ -313,6 +317,29 @@ static void write_capture(unsigned int idx, short val) {
     }
 }
 
+// The SPU IRQ (SPUCNT bit 6, IRQ address register): raised when a voice
+// fetches the block at the IRQ address, acknowledged by clearing the enable
+// bit. Games time their sound drivers with it (MGS loops a silent sample at
+// the address and runs its driver tick off the interrupt). The callback is
+// NOT run here: on the ESP32 the samples are pulled on another core than the
+// game, so the interrupts are only counted and the platform delivers them
+// from the game's side (see psyz_pending_spu_irq).
+volatile int psyz_pending_spu_irq;
+// statistics for the platform's audio diagnostics
+volatile unsigned psyz_spu_irq_raised, psyz_spu_voices_active;
+
+static inline void spu_irq_check(unsigned addr) {
+    SPU_RXX* rxx = (SPU_RXX*)&_spu_RXX->rxx;
+    if ((rxx->spucnt & SPU_CTRL_MASK_IRQ9_ENABLE) &&
+        (addr >> 3) == rxx->irq_addr) {
+        // one interrupt per pass over the address: a counter, since the
+        // platform delivers them later and must not lose any
+        rxx->spustat |= 1u << 6;
+        __atomic_fetch_add(&psyz_pending_spu_irq, 1, __ATOMIC_RELAXED);
+        psyz_spu_irq_raised++;
+    }
+}
+
 static int voice_decode_one_sample(VoiceState* vs) {
     if (vs->sample_idx >= ADPCM_BLOCK_SAMPLES) {
         // end of block, and handle loop/end flags
@@ -330,6 +357,7 @@ static int voice_decode_one_sample(VoiceState* vs) {
     }
     if (vs->needs_decode) {
         unsigned char block[ADPCM_BLOCK_BYTES];
+        spu_irq_check(vs->cur_addr);
         Psyz_SpuMemRead(vs->cur_addr, block, ADPCM_BLOCK_BYTES);
         spu_adpcm_decode_block(
             block, &vs->hist1, &vs->hist2, vs->samples, &vs->block_flags);
@@ -539,9 +567,11 @@ static void spu_tick(short* out) {
 
     // decode+resample, scale volume by ADSR envelope, then mix voices
     short v1_sample = 0, v3_sample = 0;
+    unsigned active = 0;
     for (int v = 0; v < PSYZ_SPU_NUM_VOICES; v++) {
         if (!spu.voice[v].active)
             continue;
+        active++;
         short s = voice_step(v);
         voice_envelope_step(&spu.voice[v]);
         if (spu.voice[v].env_state == ADSR_OFF) {
@@ -571,6 +601,7 @@ static void spu_tick(short* out) {
         right_sum += (cd_right * rxx->cd_vol.right) >> 15;
     }
 
+    psyz_spu_voices_active = active;
     out[0] = clamp16((left_sum * clamp15(rxx->main_vol.left)) >> 14);
     out[1] = clamp16((right_sum * clamp15(rxx->main_vol.right)) >> 14);
 
@@ -602,11 +633,21 @@ void Psyz_SpuPullSamples(short* out, int num_frames) {
         return;
     }
 #ifdef ESP_PLATFORM
-    psyz_pending_rcnt += num_frames;
+    __atomic_fetch_add(&psyz_pending_rcnt, num_frames, __ATOMIC_RELAXED);
 #else
     Psyz_RcntAdd(num_frames);
 #endif
     for (int i = 0; i < num_frames; i++) {
         spu_tick(&out[i * 2]);
     }
+}
+
+// platform diagnostics: the registers the IRQ comparison reads, and where a
+// voice is fetching from
+void Psyz_SpuDebug(unsigned* spucnt, unsigned* irq_addr, int v, unsigned* cur_addr,
+                   unsigned* active) {
+    *spucnt = _spu_RXX->rxx.spucnt;
+    *irq_addr = _spu_RXX->rxx.irq_addr;
+    *cur_addr = spu.voice[v].cur_addr;
+    *active = spu.voice[v].active;
 }

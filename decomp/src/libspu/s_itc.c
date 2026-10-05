@@ -2,11 +2,14 @@
 #include "libapi.h"
 
 long SpuIsTransferCompleted(long immediateFlag) {
-#ifdef __psyz // HACK the TestEvent must work
-    if (immediateFlag == 0) {
-        return 1;
-    }
-    return 0;
+#ifdef __psyz
+    /* psyz's transfers are synchronous (Psyz_SpuMemWrite copies in place), so
+     * a transfer is complete the moment SpuWrite returns: both the wait and
+     * the peek form answer yes. (The earlier version answered no to the peek,
+     * which left drivers that poll it before the next write -- MGS's wave
+     * loader -- believing a transfer was still running.) */
+    (void)immediateFlag;
+    return 1;
 #endif
     s32 in_transfer;
 
