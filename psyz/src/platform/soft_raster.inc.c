@@ -79,7 +79,16 @@ typedef struct {
 // 8-way store of recently used CLUTs (4KB DRAM). Texel fetches then cost one
 // PSRAM read instead of two. Any VRAM image op invalidates everything - CLUT
 // uploads and palette animation go through LoadImage.
-static u16 clut_cache[8][256];
+#ifdef ESP_PLATFORM
+/* a platform may place this file's statics in PSRAM wholesale (a linker
+ * fragment covering the archive); the cache is the one thing that must be
+ * internal, so it is taken from the internal heap on first use */
+#include "esp_heap_caps.h"
+static u16 (*clut_cache)[256];
+#else
+static u16 clut_cache_storage[8][256];
+#define clut_cache clut_cache_storage
+#endif
 static u16 clut_cache_key[8] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
                                 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
 static u8 clut_cache_next;
@@ -89,6 +98,15 @@ static void clut_cache_flush(void) {
     }
 }
 static inline const u16* clut_cached(u16 id, const u16* src, int n) {
+#ifdef ESP_PLATFORM
+    if (!clut_cache) {
+        clut_cache = heap_caps_malloc(8 * 256 * sizeof(u16), MALLOC_CAP_INTERNAL);
+        if (!clut_cache) {
+            return src;
+        }
+        clut_cache_flush();
+    }
+#endif
     for (int i = 0; i < 8; i++) {
         if (clut_cache_key[i] == id) {
             return clut_cache[i];
@@ -193,6 +211,24 @@ static inline u16 tex_fetch(const Tex* t, int u, int v) {
 // when the primitive is semi-transparent.
 #ifdef ESP_PLATFORM
 unsigned psyz_texel_zero, psyz_texel_ok, psyz_flat_px;
+/* per-pixel statistics are read-modify-writes in the inner loops: opt-in */
+#ifdef SOFT_RASTER_STATS
+#define STAT_INC(c) ((c)++)
+#else
+#define STAT_INC(c) ((void)0)
+#endif
+/* where the raster time goes, by primitive class: cycles and calls for
+ * textured triangles, generic (semi-transparent) flat triangles, fast-path
+ * flat triangles, sprites, tiles, lines */
+#include "esp_cpu.h"
+#include "esp_heap_caps.h"
+unsigned psyz_prof_cy[6], psyz_prof_n[6];
+/* finer: textured rows, textured pixels, cycles inside the span loops, cycles
+ * in tex_from (CLUT cache) */
+unsigned psyz_prof_rows, psyz_prof_px, psyz_prof_span_cy, psyz_prof_texfrom_cy;
+
+#define PROF_BEGIN() uint32_t prof_t0_ = esp_cpu_get_cycle_count()
+#define PROF_END(k) (psyz_prof_cy[k] += esp_cpu_get_cycle_count() - prof_t0_, psyz_prof_n[k]++)
 unsigned psyz_tri_off, psyz_tri_tiny, psyz_tri_ok;
 /* polygons the PSX GPU would have refused for exceeding 1023x511 */
 unsigned psyz_tri_huge;
@@ -201,12 +237,12 @@ static inline void put_texel(u16* dst, u16 texel, int r8, int g8, int b8,
                              int semi, int abr) {
     if (texel == 0) {
 #ifdef ESP_PLATFORM
-        psyz_texel_zero++;
+        STAT_INC(psyz_texel_zero);
 #endif
         return;
     }
 #ifdef ESP_PLATFORM
-    psyz_texel_ok++;
+    STAT_INC(psyz_texel_ok);
 #endif
     // 0x80 modulation is neutral: mod5(t,128)==t, so the whole mul/clamp
     // chain collapses to a passthrough (bit-exact with the general form)
@@ -366,8 +402,116 @@ SOFT_RASTER_IRAM static void raster_tile(const SV* v, int w, int h, int semi, in
 
 // Triangle with gouraud + affine UV, integer edge functions, top-left rule.
 // 2D game, orthographic: affine interpolation is exact.
+// ---- specialised textured spans --------------------------------------------
+//
+// The generic per-pixel loop decided bpp, shading, blending and modulation
+// anew for every texel, and on an in-order core those branches plus the
+// reloads they force cost more than the texel itself. Here the decisions are
+// template parameters of an always-inline body: each call site below with
+// literal arguments becomes its own straight-line loop. Pixel semantics are
+// those of put_texel (texel 0 never drawn, STP-gated blending, 0x80 neutral
+// modulation), so output is bit-exact with the generic loop.
+typedef struct {
+    u16* dst;
+    int n;
+    int32_t ui, vi, udx, vdx;
+    int32_t ri, gi, bi, rdx, gdx, bdx;
+    int r8, g8, b8;
+} TexSpan;
+
+static inline __attribute__((always_inline)) void tex_span_body(
+    const Tex* t, const TexSpan* sp, const int bpp, const int gouraud,
+    const int semi, const int modulate) {
+    u16* __restrict dst = sp->dst;
+    const u16* __restrict page = t->page;
+    const u16* __restrict clut = t->clut;
+    const int abr = t->abr;
+    int32_t ui = sp->ui, vi = sp->vi;
+    const int32_t udx = sp->udx, vdx = sp->vdx;
+    int32_t ri = sp->ri, gi = sp->gi, bi = sp->bi;
+    const int32_t rdx = sp->rdx, gdx = sp->gdx, bdx = sp->bdx;
+    const int cr = sp->r8, cg = sp->g8, cb = sp->b8;
+    for (int n = sp->n; n > 0; n--, dst++, ui += udx, vi += vdx) {
+        const int u = (ui >> 16) & 0xFF;
+        const int v = (vi >> 16) & 0xFF;
+        u16 texel;
+        if (bpp == 0) {
+            const u16 hw = page[(v << 10) + (u >> 2)];
+            texel = clut[(hw >> ((u & 3) << 2)) & 0xF];
+        } else if (bpp == 1) {
+            const u16 hw = page[(v << 10) + (u >> 1)];
+            texel = clut[(hw >> ((u & 1) << 3)) & 0xFF];
+        } else {
+            texel = page[(v << 10) + u];
+        }
+        int r8 = cr, g8 = cg, b8 = cb;
+        if (gouraud) {
+            r8 = (int)(ri >> 16);
+            g8 = (int)(gi >> 16);
+            b8 = (int)(bi >> 16);
+            ri += rdx; gi += gdx; bi += bdx;
+        }
+        if (texel == 0) {
+            continue;
+        }
+        if (!modulate && !gouraud) {
+            if (semi && (texel & 0x8000)) {
+                *dst = blend5551(*dst, texel & 0x1F, (texel >> 5) & 0x1F,
+                                 (texel >> 10) & 0x1F, abr);
+            } else {
+                *dst = texel;
+            }
+            continue;
+        }
+        if (gouraud && r8 == 0x80 && g8 == 0x80 && b8 == 0x80) {
+            if (semi && (texel & 0x8000)) {
+                *dst = blend5551(*dst, texel & 0x1F, (texel >> 5) & 0x1F,
+                                 (texel >> 10) & 0x1F, abr);
+            } else {
+                *dst = texel;
+            }
+            continue;
+        }
+        const int r = mod5(texel & 0x1F, r8);
+        const int g = mod5((texel >> 5) & 0x1F, g8);
+        const int b = mod5((texel >> 10) & 0x1F, b8);
+        if (semi && (texel & 0x8000)) {
+            *dst = blend5551(*dst, r, g, b, abr);
+        } else {
+            *dst = (u16)(r | (g << 5) | (b << 10) | (texel & 0x8000));
+        }
+    }
+}
+
+#define TEX_SPAN_CASE(bpp, g, s, m)                                            \
+    case ((bpp) << 3) | ((g) << 2) | ((s) << 1) | (m):                         \
+        tex_span_body(t, sp, bpp, g, s, m);                                    \
+        break;
+#define TEX_SPAN_CASES_BPP(bpp)                                                \
+    TEX_SPAN_CASE(bpp, 0, 0, 0) TEX_SPAN_CASE(bpp, 0, 0, 1)                    \
+    TEX_SPAN_CASE(bpp, 0, 1, 0) TEX_SPAN_CASE(bpp, 0, 1, 1)                    \
+    TEX_SPAN_CASE(bpp, 1, 0, 1) TEX_SPAN_CASE(bpp, 1, 1, 1)
+
+SOFT_RASTER_IRAM static void tex_span_dispatch(const Tex* t, const TexSpan* sp,
+                                               int gouraud, int semi, int modulate) {
+    int bpp = t->bpp > 2 ? 2 : t->bpp;
+    if (gouraud) modulate = 1;
+    switch ((bpp << 3) | ((gouraud ? 1 : 0) << 2) | ((semi ? 1 : 0) << 1) | (modulate ? 1 : 0)) {
+        TEX_SPAN_CASES_BPP(0)
+        TEX_SPAN_CASES_BPP(1)
+        TEX_SPAN_CASES_BPP(2)
+    default:
+        break;
+    }
+}
+#undef TEX_SPAN_CASE
+#undef TEX_SPAN_CASES_BPP
+
 SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, int textured,
                        u16 tpage, u16 clut, int semi, int gouraud) {
+#ifdef ESP_PLATFORM
+    const uint32_t prof_setup_t0 = esp_cpu_get_cycle_count();
+#endif
     int ax = a->x + st.ox, ay = a->y + st.oy;
     int bx = b->x + st.ox, by = b->y + st.oy;
     int cx = c->x + st.ox, cy = c->y + st.oy;
@@ -464,8 +608,16 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     int bias2 = (A2 > 0 || (A2 == 0 && B2 > 0)) ? 0 : -1;
 
     Tex t;
+    int tex_mode = 0;
     if (textured) {
+#ifdef ESP_PLATFORM
+        const uint32_t tf0 = esp_cpu_get_cycle_count();
+#endif
         t = tex_from(tpage, clut);
+#ifdef ESP_PLATFORM
+        psyz_prof_texfrom_cy += esp_cpu_get_cycle_count() - tf0;
+#endif
+        tex_mode = (!gouraud && a->r == 0x80 && a->g == 0x80 && a->b == 0x80) ? 0 : 1;
     }
 
     int w0row = A0 * minx + B0 * miny + C0 + bias0;
@@ -479,10 +631,44 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     // over (x,y): compute d/dx and d/dy once with a handful of divisions, then
     // step. The +area/2 rounds the gradient to nearest, which keeps the last
     // scanline of a 255-wide gradient from drifting versus the exact form.
+#ifdef SOFT_RASTER_RECIP
+    // RV32 has no 64-bit divide: each of the fifteen (s64)/area below is a
+    // library call of a few hundred cycles, which per triangle outweighed the
+    // texels. One 64-bit divide gives 2^32/area; every quotient is then a
+    // 32x32->64 multiply for a first guess and one multiply-compare that
+    // corrects it to the exact rounded result the division gave (the guess
+    // is within one of it). Shapes outside the range the guess is valid for
+    // (a numerator beyond 2^31, or area 1) take the division itself.
+    typedef long long s64;
+    typedef unsigned long long u64;
+    const u64 inv_area = ((u64)1 << 32) / (u64)area;
+    s64 dx_, dy_;
+    s64 div_area_16(s64 num) /* (num << 16 +- area/2) / area, like the exact form */
+    {
+        const int neg = num < 0;
+        u64 mag = (u64)(neg ? -num : num);
+        u64 q;
+        if (mag >= (1ull << 31) || area < 2) {
+            q = ((mag << 16) + (u64)area / 2) / (u64)area;
+        } else {
+            const u64 m = (mag << 16) + (u64)area / 2;
+            q = (mag * inv_area) >> 16; /* <= exact */
+            s64 rem = (s64)(m - q * (u64)area);
+            while (rem >= area) { q++; rem -= area; }
+            while (rem < 0) { q--; rem += area; }
+        }
+        return neg ? -(s64)q : (s64)q;
+    }
+#define DIV_AREA_16(num) div_area_16((s64)(num))
+#define GRAD(p0, p1, p2)                                                       \
+    dx_ = DIV_AREA_16((s64)(A0) * (p0) + (s64)(A1) * (p1) + (s64)(A2) * (p2)); \
+    dy_ = DIV_AREA_16((s64)(B0) * (p0) + (s64)(B1) * (p1) + (s64)(B2) * (p2));
+#else
 #define GRAD(p0, p1, p2)                                                           dx_ = ((s64)(A0) * (p0) + (s64)(A1) * (p1) + (s64)(A2) * (p2)) * 65536;        dy_ = ((s64)(B0) * (p0) + (s64)(B1) * (p1) + (s64)(B2) * (p2)) * 65536;        dx_ = dx_ >= 0 ? (dx_ + area / 2) / area : (dx_ - area / 2) / area;            dy_ = dy_ >= 0 ? (dy_ + area / 2) / area : (dy_ - area / 2) / area;
 
     typedef long long s64;
     s64 dx_, dy_;
+#endif
     int e0r = w0row - bias0, e1r = w1row - bias1, e2r = w2row - bias2;
 
     // Accumulators are 32-bit 16.16: attributes are 8-bit, spans are under
@@ -494,21 +680,35 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     fx rrow = 0, grow = 0, brow = 0, urow = 0, vrow = 0;
     fx rdx = 0, rdy = 0, gdx = 0, gdy = 0, bdx = 0, bdy = 0;
     fx udx = 0, udy = 0, vdx = 0, vdy = 0;
+#ifdef SOFT_RASTER_RECIP
+#define ROW0(p0, p1, p2) ((fx)DIV_AREA_16((s64)e0r * (p0) + (s64)e1r * (p1) + (s64)e2r * (p2)))
+#else
+#define ROW0(p0, p1, p2) ((fx)(((s64)(e0r * (p0) + e1r * (p1) + e2r * (p2)) << 16) / area))
+#endif
     if (gouraud) {
         GRAD(a->r, b->r, c->r) rdx = (fx)dx_; rdy = (fx)dy_;
         GRAD(a->g, b->g, c->g) gdx = (fx)dx_; gdy = (fx)dy_;
         GRAD(a->b, b->b, c->b) bdx = (fx)dx_; bdy = (fx)dy_;
-        rrow = (fx)(((s64)(e0r * a->r + e1r * b->r + e2r * c->r) << 16) / area);
-        grow = (fx)(((s64)(e0r * a->g + e1r * b->g + e2r * c->g) << 16) / area);
-        brow = (fx)(((s64)(e0r * a->b + e1r * b->b + e2r * c->b) << 16) / area);
+        rrow = ROW0(a->r, b->r, c->r);
+        grow = ROW0(a->g, b->g, c->g);
+        brow = ROW0(a->b, b->b, c->b);
     }
     if (textured) {
         GRAD(a->u, b->u, c->u) udx = (fx)dx_; udy = (fx)dy_;
         GRAD(a->v, b->v, c->v) vdx = (fx)dx_; vdy = (fx)dy_;
-        urow = (fx)(((s64)(e0r * a->u + e1r * b->u + e2r * c->u) << 16) / area);
-        vrow = (fx)(((s64)(e0r * a->v + e1r * b->v + e2r * c->v) << 16) / area);
+        urow = ROW0(a->u, b->u, c->u);
+        vrow = ROW0(a->v, b->v, c->v);
     }
 #undef GRAD
+#undef ROW0
+#ifdef SOFT_RASTER_RECIP
+#undef DIV_AREA_16
+#endif
+#ifdef ESP_PLATFORM
+    /* slot 5: the per-triangle setup, from entry to here */
+    psyz_prof_cy[5] += esp_cpu_get_cycle_count() - prof_setup_t0;
+    psyz_prof_n[5]++;
+#endif
 
     // Fast path for the dominant WRP case: opaque untextured spans (the big
     // gouraud background quads). Span bounds come from the edge functions
@@ -614,6 +814,22 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
         fx ui = urow + (fx)(xl - minx) * udx;
         fx vi = vrow + (fx)(xl - minx) * vdx;
         u16* row = vram + y * VRAM_W;
+        if (textured) {
+            // one specialised loop per (bpp, shading, blending) combination:
+            // every test the generic loop made per pixel is made once here
+            TexSpan sp = {row + xl, xr - xl + 1, ui, vi, udx, vdx,
+                          ri, gi, bi, rdx, gdx, bdx, a->r, a->g, a->b};
+#ifdef ESP_PLATFORM
+            const uint32_t sp0 = esp_cpu_get_cycle_count();
+            tex_span_dispatch(&t, &sp, gouraud, semi, tex_mode);
+            psyz_prof_span_cy += esp_cpu_get_cycle_count() - sp0;
+            psyz_prof_rows++;
+            psyz_prof_px += (unsigned)sp.n;
+#else
+            tex_span_dispatch(&t, &sp, gouraud, semi, tex_mode);
+#endif
+            continue;
+        }
         for (int x = xl; x <= xr; x++, ri += rdx, gi += gdx, bi += bdx,
                  ui += udx, vi += vdx) {
             int r8 = a->r, g8 = a->g, b8 = a->b;
@@ -838,11 +1054,19 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 v[i].r = v[i].g = v[i].b = 0x80;
             }
         }
-        raster_tri(&v[0], &v[1], &v[2], isTextured, tpage, clut, isSemi,
-                   isGouraud);
-        if (n == 4) {
-            raster_tri(&v[1], &v[3], &v[2], isTextured, tpage, clut, isSemi,
+        {
+#ifdef ESP_PLATFORM
+            PROF_BEGIN();
+#endif
+            raster_tri(&v[0], &v[1], &v[2], isTextured, tpage, clut, isSemi,
                        isGouraud);
+            if (n == 4) {
+                raster_tri(&v[1], &v[3], &v[2], isTextured, tpage, clut, isSemi,
+                           isGouraud);
+            }
+#ifdef ESP_PLATFORM
+            PROF_END(isTextured ? 0 : (isSemi ? 1 : 2));
+#endif
         }
     } else if (isLine) {
         bool padding = true;
@@ -924,10 +1148,18 @@ int Draw_PushPrim(u_long* packets, int max_len) {
         default:
             break;
         }
-        if (isTextured) {
-            raster_sprite(&v[0], w, h, tpage, clut, isSemi);
-        } else {
-            raster_tile(&v[0], w, h, isSemi, (cur_tpage >> 5) & 3);
+        {
+#ifdef ESP_PLATFORM
+            PROF_BEGIN();
+#endif
+            if (isTextured) {
+                raster_sprite(&v[0], w, h, tpage, clut, isSemi);
+            } else {
+                raster_tile(&v[0], w, h, isSemi, (cur_tpage >> 5) & 3);
+            }
+#ifdef ESP_PLATFORM
+            PROF_END(isTextured ? 3 : 4);
+#endif
         }
     }
     return max_len - len;

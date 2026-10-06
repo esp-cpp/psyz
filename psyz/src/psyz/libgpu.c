@@ -447,6 +447,15 @@ static int GPU_DataWrite(u_long p1, u_long p2) {
 #ifdef ESP_PLATFORM
     psyz_prof_load_us += (unsigned)(esp_timer_get_time() - t);
     psyz_prof_load_n++;
+    {
+        /* who loads an image every frame in steady state? */
+        static unsigned calls;
+        calls++;
+        if (calls > 400 && calls <= 406) {
+            const RECT* r = (const RECT*)(uintptr_t)p1;
+            printf("[load] rect %d,%d %dx%d\n", r->x, r->y, r->w, r->h);
+        }
+    }
 #endif
     return 0;
 }
