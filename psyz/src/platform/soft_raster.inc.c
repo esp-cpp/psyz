@@ -34,7 +34,6 @@ void Draw_SetTextureWindow(unsigned int mask_x, unsigned int mask_y,
                            unsigned int off_x, unsigned int off_y) {
     (void)mask_x; (void)mask_y; (void)off_x; (void)off_y;
 }
-void Draw_SetMask(int bit0, int bit1) { (void)bit0; (void)bit1; }
 #endif // SOFT_RASTER_STANDALONE
 
 // ==================== core (SDL-free, ESP32-ready) ====================
@@ -59,8 +58,33 @@ static u16* vram; // resolved once in InitPlatform
 typedef struct {
     int x0, y0, x1, y1; // draw area, inclusive
     int ox, oy;         // draw offset
+    // GP0 E6, the mask bit: mask_or is 0x8000 while "set mask bit on drawn
+    // pixels" is on; mask_check skips pixels whose bit 15 is set. Effects
+    // that reuse the frame as a texture depend on the first (a black pixel
+    // written as 0x8000 is not the never-drawn texel 0x0000).
+    u16 mask_or;
+    int mask_check;
 } SoftState;
-static SoftState st = {0, 0, VRAM_W - 1, VRAM_H - 1, 0, 0};
+static SoftState st = {0, 0, VRAM_W - 1, VRAM_H - 1, 0, 0, 0, 0};
+
+// every pixel write goes through this: honours both mask modes
+#define MASK_WRITE(dstp, val)                                                  \
+    do {                                                                       \
+        u16* mw_d_ = (dstp);                                                   \
+        if (!(st.mask_check && (*mw_d_ & 0x8000))) {                           \
+            *mw_d_ = (u16)((val) | st.mask_or);                                \
+        }                                                                      \
+    } while (0)
+// true while either mode is on: the paired-store fast paths step aside
+#define MASK_ACTIVE() (st.mask_or | st.mask_check)
+
+#ifdef SOFT_RASTER_STANDALONE
+void Draw_SetMask(int bit0, int bit1) {
+    st.mask_or = bit0 ? 0x8000 : 0;
+    st.mask_check = bit1;
+}
+#endif
+
 
 // One vertex after packet parsing. Colors stay 8-bit until the pixel write.
 typedef struct {
@@ -248,10 +272,10 @@ static inline void put_texel(u16* dst, u16 texel, int r8, int g8, int b8,
     // chain collapses to a passthrough (bit-exact with the general form)
     if (r8 == 0x80 && g8 == 0x80 && b8 == 0x80) {
         if (semi && (texel & 0x8000)) {
-            *dst = blend5551(*dst, texel & 0x1F, (texel >> 5) & 0x1F,
-                             (texel >> 10) & 0x1F, abr);
+            MASK_WRITE(dst, blend5551(*dst, texel & 0x1F, (texel >> 5) & 0x1F,
+                                      (texel >> 10) & 0x1F, abr));
         } else {
-            *dst = texel;
+            MASK_WRITE(dst, texel);
         }
         return;
     }
@@ -259,9 +283,9 @@ static inline void put_texel(u16* dst, u16 texel, int r8, int g8, int b8,
     int g = mod5((texel >> 5) & 0x1F, g8);
     int b = mod5((texel >> 10) & 0x1F, b8);
     if (semi && (texel & 0x8000)) {
-        *dst = blend5551(*dst, r, g, b, abr);
+        MASK_WRITE(dst, blend5551(*dst, r, g, b, abr));
     } else {
-        *dst = (u16)(r | (g << 5) | (b << 10) | (texel & 0x8000));
+        MASK_WRITE(dst, (u16)(r | (g << 5) | (b << 10) | (texel & 0x8000)));
     }
 }
 
@@ -272,9 +296,9 @@ static inline void put_flat(u16* dst, int r8, int g8, int b8, int semi,
 #endif
     int r = r8 >> 3, g = g8 >> 3, b = b8 >> 3;
     if (semi) {
-        *dst = blend5551(*dst, r, g, b, abr);
+        MASK_WRITE(dst, blend5551(*dst, r, g, b, abr));
     } else {
-        *dst = (u16)(r | (g << 5) | (b << 10));
+        MASK_WRITE(dst, (u16)(r | (g << 5) | (b << 10)));
     }
 }
 
@@ -305,7 +329,7 @@ SOFT_RASTER_IRAM static void raster_sprite(const SV* v, int w, int h, u16 tpage,
             // one 32-bit store. Per-texel semantics are identical to the
             // general path (texel 0 stays transparent, neutral mod is a
             // passthrough), so output is bit-for-bit the same.
-            if (!semi && v->r == 0x80 && v->g == 0x80 && v->b == 0x80 &&
+            if (!semi && !MASK_ACTIVE() && v->r == 0x80 && v->g == 0x80 && v->b == 0x80 &&
                 ((v->u + i0) & 3) == 0 && ((i1 - i0) & 3) == 3) {
                 u16* dst = &row[x0 + i0];
                 for (int n = i0; n <= i1; n += 4) {
@@ -366,7 +390,7 @@ SOFT_RASTER_IRAM static void raster_tile(const SV* v, int w, int h, int semi, in
      * store into PSRAM. Writing pairs as one 32-bit store halves the store
      * count and lets the memory bus move a full word per transaction. Output
      * is bit-for-bit what put_flat produced. */
-    if (!semi) {
+    if (!semi && !MASK_ACTIVE()) {
         u16 c = (u16)((v->r >> 3) | ((v->g >> 3) << 5) | ((v->b >> 3) << 10));
         u32 cc = (u32)c | ((u32)c << 16);
         for (int y = ya; y <= yb; y++) {
@@ -431,6 +455,8 @@ static inline __attribute__((always_inline)) void tex_span_body(
     int32_t ri = sp->ri, gi = sp->gi, bi = sp->bi;
     const int32_t rdx = sp->rdx, gdx = sp->gdx, bdx = sp->bdx;
     const int cr = sp->r8, cg = sp->g8, cb = sp->b8;
+    const int mchk = st.mask_check;
+    const u16 mor = st.mask_or;
     for (int n = sp->n; n > 0; n--, dst++, ui += udx, vi += vdx) {
         const int u = (ui >> 16) & 0xFF;
         const int v = (vi >> 16) & 0xFF;
@@ -454,21 +480,24 @@ static inline __attribute__((always_inline)) void tex_span_body(
         if (texel == 0) {
             continue;
         }
+        if (mchk && (*dst & 0x8000)) {
+            continue;
+        }
         if (!modulate && !gouraud) {
             if (semi && (texel & 0x8000)) {
                 *dst = blend5551(*dst, texel & 0x1F, (texel >> 5) & 0x1F,
-                                 (texel >> 10) & 0x1F, abr);
+                                 (texel >> 10) & 0x1F, abr) | mor;
             } else {
-                *dst = texel;
+                *dst = texel | mor;
             }
             continue;
         }
         if (gouraud && r8 == 0x80 && g8 == 0x80 && b8 == 0x80) {
             if (semi && (texel & 0x8000)) {
                 *dst = blend5551(*dst, texel & 0x1F, (texel >> 5) & 0x1F,
-                                 (texel >> 10) & 0x1F, abr);
+                                 (texel >> 10) & 0x1F, abr) | mor;
             } else {
-                *dst = texel;
+                *dst = texel | mor;
             }
             continue;
         }
@@ -476,9 +505,9 @@ static inline __attribute__((always_inline)) void tex_span_body(
         const int g = mod5((texel >> 5) & 0x1F, g8);
         const int b = mod5((texel >> 10) & 0x1F, b8);
         if (semi && (texel & 0x8000)) {
-            *dst = blend5551(*dst, r, g, b, abr);
+            *dst = blend5551(*dst, r, g, b, abr) | mor;
         } else {
-            *dst = (u16)(r | (g << 5) | (b << 10) | (texel & 0x8000));
+            *dst = (u16)(r | (g << 5) | (b << 10) | (texel & 0x8000)) | mor;
         }
     }
 }
@@ -716,7 +745,7 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     // inner loop steps only RGB and writes pixel pairs with 32-bit stores.
     // Attribute stepping is identical to the generic loop, so pixel output
     // is bit-exact with it.
-    if (!textured && !semi) {
+    if (!textured && !semi && !MASK_ACTIVE()) {
         fx r0 = gouraud ? rrow : (fx)(a->r << 16);
         fx g0 = gouraud ? grow : (fx)(a->g << 16);
         fx b0 = gouraud ? brow : (fx)(a->b << 16);
