@@ -58,10 +58,32 @@ static void GPU_read_image() { NOT_IMPLEMENTED; }
 int psyz_queue_canary_lo;
 static int queue_len = 0;
 int psyz_queue_canary_hi;
+#endif
+#define QUEUE_CAP 0x4000
+#ifdef ESP_PLATFORM
+/* The rasterizer runs on the other core (see Psyz_GpuWorkerStart): the game
+ * fills one queue while the worker executes the other. Everything below that
+ * touches queue_buf / queue_len is the FILL side and runs on the game core;
+ * the worker only ever sees exec_buf / exec_len. */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
+PSYZ_ESP_XRAM static u_long queue_bufs[2][QUEUE_CAP];
+static u_long* queue_buf = queue_bufs[0];
+static int fill_idx;
+static u_long* exec_buf;
+static int exec_len;
+static volatile int raster_busy;
+static volatile int enqueue_in_progress;
+static TaskHandle_t raster_task;
+static SemaphoreHandle_t raster_done;
+static int psyz_exec_queue(u_long* queue_buf, int queue_len);
 #else
 static int queue_len = 0;
+static u_long queue_buf[QUEUE_CAP];
 #endif
-PSYZ_ESP_XRAM static u_long queue_buf[0x4000];
 #ifdef ESP_PLATFORM
 /* rough phase timing: where does the frame actually go? */
 unsigned psyz_prof_exeq_us, psyz_prof_load_us, psyz_prof_load_n;
@@ -72,13 +94,112 @@ static long long psyz_prof_t0;
 extern unsigned sotn_move_count, sotn_exeque_count;
 #endif
 
+#ifdef ESP_PLATFORM
+/* Wait until the worker has finished the batch it holds (no-op without one). */
+static void psyz_wait_raster(void) {
+    while (raster_busy) {
+        xSemaphoreTake(raster_done, portMAX_DELAY);
+    }
+}
+
+/* Hand the fill queue to the worker. Blocks only while the worker is still
+ * busy with the previous batch. Without a worker, executes synchronously. */
 int Psyz_GpuExeque() {
+    if (queue_len == 0) {
+        return 0;
+    }
+    if (!raster_task) {
+        psyz_exec_queue(queue_buf, queue_len);
+        queue_len = 0;
+        return 0;
+    }
+    /* The vblank tick's poll (DrawSync(1)) may submit too, and it preempts
+     * this thread on the same core: a submit it starts in the middle of ours
+     * swapped the buffers twice and left the game filling the buffer being
+     * drawn -- seen as the title screen's text and logo flickering. The
+     * flag hands the tick off until the swap is published. */
+    enqueue_in_progress = 1;
+    psyz_wait_raster();
+    exec_buf = queue_buf;
+    exec_len = queue_len;
+    fill_idx ^= 1;
+    queue_buf = queue_bufs[fill_idx];
+    queue_len = 0;
+    raster_busy = 1;
+    xTaskNotifyGive(raster_task);
+    enqueue_in_progress = 0;
+    return 0;
+}
+
+/* DrawSync(0): everything queued so far has been drawn. */
+void Psyz_GpuSync(void) {
+    Psyz_GpuExeque();
+    psyz_wait_raster();
+}
+
+/* DrawSync(1): is the GPU still busy? Never blocks -- the vblank tick asks
+ * this. Submits the fill queue when the worker is free so nothing sits
+ * unexecuted waiting for a DrawOTag that may not come. */
+static int Psyz_GpuPoll(void) {
+    if (queue_len > 0 && !raster_busy && !enqueue_in_progress) {
+        Psyz_GpuExeque();
+    }
+    return raster_busy ? 1 : 0;
+}
+
+static void psyz_raster_task(void* arg) {
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (!raster_busy) {
+            continue; /* a stray wake: nothing was handed over */
+        }
+        psyz_exec_queue(exec_buf, exec_len);
+        raster_busy = 0;
+        xSemaphoreGive(raster_done);
+    }
+}
+
+void Psyz_GpuWorkerStart(void) {
+    if (raster_task) {
+        return;
+    }
+    if (!raster_done) {
+        raster_done = xSemaphoreCreateBinary();
+    }
+    raster_busy = 0;
+    if (xTaskCreatePinnedToCoreWithCaps(psyz_raster_task, "psyz_raster", 8192,
+                                        NULL, 4, &raster_task, 1,
+                                        MALLOC_CAP_SPIRAM) != pdPASS) {
+        raster_task = NULL;
+        printf("[gpu] no raster worker: drawing stays on the game core\n");
+        return;
+    }
+    printf("[gpu] raster worker on core 1 (prio 4), %d-word queues x2\n", QUEUE_CAP);
+}
+
+void Psyz_GpuWorkerStop(void) {
+    if (!raster_task) {
+        return;
+    }
+    Psyz_GpuSync();
+    vTaskDeleteWithCaps(raster_task);
+    raster_task = NULL;
+    vSemaphoreDelete(raster_done);
+    raster_done = NULL;
+    raster_busy = 0;
+}
+
+static int psyz_exec_queue(u_long* queue_buf, int queue_len) {
     RECT rect;
     unsigned int x, y;
-#ifdef ESP_PLATFORM
     sotn_exeque_count++;
     { extern long long esp_timer_get_time(void);
       psyz_prof_t0 = esp_timer_get_time(); }
+#else
+int Psyz_GpuExeque() {
+    RECT rect;
+    unsigned int x, y;
 #endif
     Draw_ResetBuffer();
     for (int i = 0; i < queue_len; i++) {
@@ -320,12 +441,13 @@ int Psyz_GpuExeque() {
     }
     Draw_FlushBuffer();
     Draw_ExequeSync();
-    queue_len = 0;
 #ifdef ESP_PLATFORM
     { extern long long esp_timer_get_time(void);
       psyz_prof_exeq_us += (unsigned)(esp_timer_get_time() - psyz_prof_t0); }
+#else
+    queue_len = 0;
 #endif
-    return queue_len;
+    return 0;
 }
 
 #ifdef ESP_PLATFORM
@@ -349,6 +471,9 @@ static int GPU_Enqueue(u_long p1, u_long p2) {
     }
     DR_ENV* env = (DR_ENV*)(uintptr_t)p1;
     DR_ENV* prev_env = NULL;
+#ifdef ESP_PLATFORM
+    enqueue_in_progress = 1;
+#endif
     while (1) {
         if (!prim_ptr_ok(env)) {
             WARNF("prim chain walked to %p (bad link stored at %p) - rest "
@@ -399,7 +524,7 @@ static int GPU_Enqueue(u_long p1, u_long p2) {
             env = (DR_ENV*)nextPrim(env);
             continue;
         }
-        if (queue_len + env->len > LEN(queue_buf)) {
+        if (queue_len + env->len > QUEUE_CAP) {
             // drain and RETRY this packet: falling through without copying
             // would still bump queue_len and enqueue garbage words
             INFOF("GPU queue full, calling exeque");
@@ -435,15 +560,52 @@ static int GPU_Enqueue(u_long p1, u_long p2) {
         }
         env = (DR_ENV*)nextPrim(env);
     }
+#ifdef ESP_PLATFORM
+    /* an ordering table is a whole frame: start drawing it now, while the
+     * game goes on to build the next one (the submit clears the flag) */
+    Psyz_GpuExeque();
+    enqueue_in_progress = 0;
+#endif
     return 0;
 }
 static int GPU_DataWrite(u_long p1, u_long p2) {
 #ifdef ESP_PLATFORM
     extern long long esp_timer_get_time(void);
     long long t = esp_timer_get_time();
-#endif
+    {
+        /* Queue the upload behind the draws that precede it, as the GPU's
+         * own 0xA0 packet with the pixels inline: the caller may reuse its
+         * buffer the moment we return (on the console a DMA had to finish
+         * first, but the sources are not that careful). An upload too big
+         * for the queue waits for the worker and goes straight to VRAM. */
+        const RECT* r = (const RECT*)(uintptr_t)p1;
+        int words = ((int)r->w * (int)r->h + 1) / 2;
+        int need = words + 3;
+        if (p2 != 0 && r->w > 0 && r->h > 0 && need <= QUEUE_CAP / 2) {
+            /* (a null source -- the menu's "nouse" slots do this -- takes the
+             * direct path, which has always tolerated it) */
+            if (queue_len + need > QUEUE_CAP) {
+                Psyz_GpuExeque();
+            }
+            enqueue_in_progress = 1;
+            queue_buf[queue_len] = 0xA0000000u;
+            queue_buf[queue_len + 1] =
+                ((u_long)(r->y & 0x1FF) << 16) | (u_long)(r->x & 0x3FF);
+            queue_buf[queue_len + 2] =
+                ((u_long)(r->h & 0x3FF) << 16) | (u_long)(r->w & 0x7FF);
+            memcpy(&queue_buf[queue_len + 3], (const void*)(uintptr_t)p2,
+                   (size_t)words * 4u);
+            queue_len += need;
+            enqueue_in_progress = 0;
+        } else {
+            Psyz_GpuSync();
+            Draw_LoadImage((RECT*)(uintptr_t)p1, (u_long*)(uintptr_t)p2);
+        }
+    }
+#else
     Psyz_GpuExeque();
     Draw_LoadImage((RECT*)(uintptr_t)p1, (u_long*)(uintptr_t)p2);
+#endif
 #ifdef ESP_PLATFORM
     psyz_prof_load_us += (unsigned)(esp_timer_get_time() - t);
     psyz_prof_load_n++;
@@ -460,7 +622,11 @@ static int GPU_DataWrite(u_long p1, u_long p2) {
     return 0;
 }
 static int GPU_DataRead(u_long p1, u_long p2) {
+#ifdef ESP_PLATFORM
+    Psyz_GpuSync(); /* the read must see every queued draw */
+#else
     Psyz_GpuExeque();
+#endif
     Draw_StoreImage((RECT*)(uintptr_t)p1, (u_long*)(uintptr_t)p2);
     return 0;
 }
@@ -568,15 +734,30 @@ static int psyz_sync(int mode) {
     // mode 1 process the queue and return how many elements have been queued
     // return -1 if GPU has timed out
     // but on PC the implementation is much simpler as it's always synced
+#ifdef ESP_PLATFORM
+    if (mode == 1) {
+        /* The game asks this from its vsync callback and SKIPS the vblank
+         * when the GPU is busy (a console GPU that has not finished within
+         * a frame means the frame is lost). The worker is busy most of the
+         * time by design -- that is the overlap we want -- so answer "idle":
+         * the frame swap waits for the worker before showing a buffer, which
+         * is the guarantee the check was standing in for. */
+        Psyz_GpuPoll();
+        return 0;
+    }
+    Psyz_GpuSync();
+    return 0;
+#else
     Psyz_GpuExeque();
     return 0;
+#endif
 }
 
 int psyz_gpu_version(int mode) { return GPU_V0; }
 
 // forwards raw GP0 words into the internal queue, then trigger execution.
 void Psyz_GpuWriteGP0(unsigned int word) {
-    if (queue_len >= (int)LEN(queue_buf)) {
+    if (queue_len >= (int)QUEUE_CAP) {
         WARNF("GPU queue full");
         return;
     }

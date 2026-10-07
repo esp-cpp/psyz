@@ -250,6 +250,8 @@ static void spu_key_on_voice(int v) {
     rxx->voice[v].volumex = 0;
 }
 
+extern volatile int psyz_pending_spu_irq;
+extern volatile unsigned psyz_spu_irq_raised, psyz_spu_irq_caught_up;
 void Psyz_SpuWrite(unsigned int reg_offset, unsigned short value) {
     if (reg_offset >= sizeof(SPU_RXX) || (reg_offset & 1)) {
         WARNF("Psyz_SpuWrite: bad offset 0x%X", reg_offset);
@@ -264,6 +266,33 @@ void Psyz_SpuWrite(unsigned int reg_offset, unsigned short value) {
     if (reg_offset == offsetof(SPU_RXX, spucnt)) {
         if (!(value & SPU_CTRL_MASK_IRQ9_ENABLE)) { // acknowledge
             _spu_RXX->rxx.spustat &= ~(1u << 6);
+        }
+    } else if (reg_offset == offsetof(SPU_RXX, irq_addr)) {
+        // Re-arming behind a voice that has already passed the new address.
+        //
+        // Samples are produced in chunks and the interrupt is noticed and
+        // handled some milliseconds after the crossing. A driver that uses
+        // a looping voice as a clock (MGS: a blank sample, the IRQ address
+        // toggled between two points 256 bytes apart, ~98 Hz) re-arms to a
+        // point the voice may by then have passed; the hardware would wait a
+        // whole lap and the clock loses a beat -- heard as streamed speech
+        // repeating a block. Raise it now instead: the beat arrives late
+        // rather than never, and the stream refill clocked by the count
+        // keeps pace with the samples.
+        if (_spu_RXX->rxx.spucnt & SPU_CTRL_MASK_IRQ9_ENABLE) {
+            for (int v = 0; v < PSYZ_SPU_NUM_VOICES; v++) {
+                VoiceState* vs = &spu.voice[v];
+                if (vs->active) {
+                    unsigned d = ((vs->cur_addr >> 3) - (unsigned)value) & 0xFFFFu;
+                    if (d > 0 && d < 32) { // passed it within the last 256 bytes
+                        _spu_RXX->rxx.spustat |= 1u << 6;
+                        __atomic_fetch_add(&psyz_pending_spu_irq, 1, __ATOMIC_RELAXED);
+                        psyz_spu_irq_raised++;
+                        psyz_spu_irq_caught_up++;
+                        break;
+                    }
+                }
+            }
         }
     } else if (reg_offset == offsetof(SPU_RXX, key_on[0])) { // voices 0..15
         for (int v = 0; v < 16; v++) {
@@ -326,7 +355,7 @@ static void write_capture(unsigned int idx, short val) {
 // from the game's side (see psyz_pending_spu_irq).
 volatile int psyz_pending_spu_irq;
 // statistics for the platform's audio diagnostics
-volatile unsigned psyz_spu_irq_raised, psyz_spu_voices_active;
+volatile unsigned psyz_spu_irq_raised, psyz_spu_voices_active, psyz_spu_irq_caught_up;
 
 static inline void spu_irq_check(unsigned addr) {
     SPU_RXX* rxx = (SPU_RXX*)&_spu_RXX->rxx;
