@@ -472,6 +472,7 @@ static int GPU_Enqueue(u_long p1, u_long p2) {
     DR_ENV* env = (DR_ENV*)(uintptr_t)p1;
     DR_ENV* prev_env = NULL;
 #ifdef ESP_PLATFORM
+    int walked = 0;
     enqueue_in_progress = 1;
 #endif
     while (1) {
@@ -486,11 +487,12 @@ static int GPU_Enqueue(u_long p1, u_long p2) {
                  * packet was allocated with the console's 4-byte-tag size */
                 static int dumps = 4;
                 if (dumps > 0) {
-                    const u32* w = (const u32*)prev_env - 8;
+                    const u32* w = (const u32*)prev_env - 40;
                     dumps--;
-                    printf("[gpu] words around %p:", (void*)prev_env);
-                    for (int k = 0; k < 20; k++) {
-                        printf(" %08lx%s", (unsigned long)w[k], k == 8 ? "*" : "");
+                    printf("[gpu] OT %p: words around %p (link #%d):", (void*)(uintptr_t)p1,
+                           (void*)prev_env, walked);
+                    for (int k = 0; k < 52; k++) {
+                        printf(" %08lx%s", (unsigned long)w[k], k == 40 ? "*" : "");
                     }
                     printf("\n");
                 }
@@ -500,7 +502,8 @@ static int GPU_Enqueue(u_long p1, u_long p2) {
         }
         prev_env = env;
 #ifdef ESP_PLATFORM
-        if ((getcode(env) & 0xE0) == 0 && env->len > 2) {
+        walked++;
+        if ((getcode(env) & 0xFF) == 0 && env->len > 2) { /* 0x01 (cache clear) heads a MoveImage */
             // a multi-word packet with command byte 0: not a legal prim.
             // Its ADDRESS names the producer via the symbol table.
             static int zero_log = 8;
