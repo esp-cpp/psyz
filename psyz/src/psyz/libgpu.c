@@ -479,6 +479,23 @@ static int GPU_Enqueue(u_long p1, u_long p2) {
             WARNF("prim chain walked to %p (bad link stored at %p) - rest "
                   "of OT dropped",
                   (void*)env, (void*)prev_env);
+#ifdef ESP_PLATFORM
+            if (prev_env) {
+                /* the packet that carried the bad link, and the words before
+                 * it: a texpage or mask command word in a link means a
+                 * packet was allocated with the console's 4-byte-tag size */
+                static int dumps = 4;
+                if (dumps > 0) {
+                    const u32* w = (const u32*)prev_env - 8;
+                    dumps--;
+                    printf("[gpu] words around %p:", (void*)prev_env);
+                    for (int k = 0; k < 20; k++) {
+                        printf(" %08lx%s", (unsigned long)w[k], k == 8 ? "*" : "");
+                    }
+                    printf("\n");
+                }
+            }
+#endif
             break;
         }
         prev_env = env;

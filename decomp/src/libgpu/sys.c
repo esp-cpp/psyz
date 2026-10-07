@@ -492,7 +492,13 @@ void SetDrawOffset(DR_OFFSET* p, u_short* ofs) {
 }
 
 typedef struct {
+#ifdef __psyz
+    O_TAG; /* the two-word tag every other packet has here: with a single
+            * word, setlen() and code[0] landed on the same word and the
+            * queue saw a length of 0xE6000001 and dropped the packet */
+#else
     u_long tag;
+#endif
     u_long code[2];
 } DR_PRIO;
 void SetPriority(DR_PRIO* p, int pbc, int pbw) {

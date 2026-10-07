@@ -80,12 +80,28 @@ void SetDrawLoad(DR_LOAD* p, RECT* rect) {
 }
 
 int MargePrim(void* p0, void* p1) {
+#ifdef __psyz
+    /* p1 follows p0 in memory and its TWO tag words become data words of
+     * the merged packet (the console had one, counted by the +1 below and
+     * harmless to its GPU as a 0x04-0x1E no-op). Zero both so the command
+     * parser sees two 0x00 no-ops: left as a pointer, the top byte of the
+     * address word was read as a draw command -- the garbage next to the
+     * opening credits, which merge a texpage packet with each sprite. */
+    int newLen = getlen(p0) + getlen(p1) + 2;
+    if (newLen > 16)
+        return -1;
+    setlen(p0, newLen);
+    ((u_long*)p1)[0] = 0;
+    ((u_long*)p1)[1] = 0;
+    return 0;
+#else
     int newLen = getlen(p0) + getlen(p1) + 1;
     if (newLen > 16)
         return -1;
     setlen(p0, newLen);
     *(u_long*)p1 = 0;
     return 0;
+#endif
 }
 
 void DumpDrawEnv(DRAWENV* env) {
