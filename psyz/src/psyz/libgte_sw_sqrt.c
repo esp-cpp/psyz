@@ -39,16 +39,34 @@ long SquareRoot0_impl(long a) {
         return 0;
     }
     if (a < 0) {
-        /* Callers pass a sum of squares, so negative means the caller's own
-         * arithmetic went wrong upstream -- there is no meaningful root to
-         * return. The code below would carry on regardless: a negative
-         * normalizes to an index outside the table and the wrap-around picks
-         * an arbitrary entry, handing back a large plausible-looking distance
-         * that then propagates into whatever the caller does with it. Zero is
-         * the honest answer and keeps the damage local to the frame that
-         * produced it. */
-        WARNF("SquareRoot0(%d) negative value", (int)a);
-        return 0;
+        /* Callers pass a sum of squares, and a negative one is that sum
+         * overflowed 32 bits -- which it does in MGS's cutscene camera for a
+         * far-off target (the submarine passing the dock: dx and dz around
+         * 45000). Read as unsigned the sum is still exact below 2^32, so the
+         * root of the unsigned value is the distance the caller meant.
+         * Returning 0 here made ratan2(dy, 0) a +-90 degree pitch: the
+         * camera stared straight into the water for the whole shot. */
+        unsigned int u = (unsigned int)a;
+        unsigned int root = 0, bit = 1u << 30;
+        static int noted = 2;
+        if (noted > 0) {
+            noted--;
+            WARNF("SquareRoot0(%d): 32-bit overflow upstream, using unsigned %u",
+                  (int)a, u);
+        }
+        while (bit > u) {
+            bit >>= 2;
+        }
+        while (bit) {
+            if (u >= root + bit) {
+                u -= root + bit;
+                root = (root >> 1) + bit;
+            } else {
+                root >>= 1;
+            }
+            bit >>= 2;
+        }
+        return (long)root;
     }
 
     lzc = gte_leadingzerocount(a);
