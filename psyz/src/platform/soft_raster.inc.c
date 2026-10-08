@@ -972,8 +972,9 @@ static void soft_load_image(const PS1_RECT* rect, const u16* src) {
 static void soft_store_image(const PS1_RECT* rect, u16* dst) {
     int w = vram_clamp_w(rect, "store"), h = vram_clamp_h(rect);
     (void)w;
+    { static int store_log = 8; if (store_log > 0) { store_log--;
     WARNF("store %d,%d %dx%d -> %p", rect->x, rect->y, rect->w, rect->h,
-          (void*)dst);
+          (void*)dst); } }
     for (int y = 0; y < h; y++) {
         const u16* src =
             vram + ((rect->y + y) & (VRAM_H - 1)) * VRAM_W + rect->x;
