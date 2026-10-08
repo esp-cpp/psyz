@@ -190,10 +190,15 @@ void Psyz_GpuWorkerStop(void) {
     raster_busy = 0;
 }
 
+volatile int psyz_trace_env; /* frames of E5/E6 tracing left (set by the game) */
 static int psyz_exec_queue(u_long* queue_buf, int queue_len) {
     RECT rect;
     unsigned int x, y;
     sotn_exeque_count++;
+    if (psyz_trace_env > 0) {
+        printf("[env] --- queue of %d words ---\n", queue_len);
+        psyz_trace_env--;
+    }
     { extern long long esp_timer_get_time(void);
       psyz_prof_t0 = esp_timer_get_time(); }
 #else
@@ -294,8 +299,20 @@ int Psyz_GpuExeque() {
                        (unsigned long)op); } }
 #endif
             Draw_SetOffset((int)op & 0x7FF, (int)(op >> 11) & 0x7FF);
+#ifdef ESP_PLATFORM
+            if (psyz_trace_env > 0) {
+                printf("[env] q%d/%d E5 offset %d,%d\n", i, queue_len, (int)op & 0x7FF,
+                       (int)(op >> 11) & 0x7FF);
+            }
+#endif
             break;
         case 0xE6:
+#ifdef ESP_PLATFORM
+            if (psyz_trace_env > 0) {
+                printf("[env] q%d/%d E6 mask set %d check %d\n", i, queue_len, (int)(op & 1),
+                       (int)((op >> 1) & 1));
+            }
+#endif
             Draw_SetMask(!!(op & 1), !!(op & 2));
             break;
         default:

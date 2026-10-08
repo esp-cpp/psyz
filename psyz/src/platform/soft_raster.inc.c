@@ -272,8 +272,14 @@ static inline void put_texel(u16* dst, u16 texel, int r8, int g8, int b8,
     // chain collapses to a passthrough (bit-exact with the general form)
     if (r8 == 0x80 && g8 == 0x80 && b8 == 0x80) {
         if (semi && (texel & 0x8000)) {
+            // A textured pixel keeps the texel's own bit 15 when written
+            // (the GPU ORs the texel's STP bit into the result). Dropping it
+            // here turned every frame-buffer feedback effect -- the zoom
+            // blur, the underwater refraction -- into a one-way copy: the
+            // next frame found no STP bit, drew its copy opaque, and the
+            // picture froze.
             MASK_WRITE(dst, blend5551(*dst, texel & 0x1F, (texel >> 5) & 0x1F,
-                                      (texel >> 10) & 0x1F, abr));
+                                      (texel >> 10) & 0x1F, abr) | 0x8000);
         } else {
             MASK_WRITE(dst, texel);
         }
@@ -283,7 +289,7 @@ static inline void put_texel(u16* dst, u16 texel, int r8, int g8, int b8,
     int g = mod5((texel >> 5) & 0x1F, g8);
     int b = mod5((texel >> 10) & 0x1F, b8);
     if (semi && (texel & 0x8000)) {
-        MASK_WRITE(dst, blend5551(*dst, r, g, b, abr));
+        MASK_WRITE(dst, blend5551(*dst, r, g, b, abr) | 0x8000);
     } else {
         MASK_WRITE(dst, (u16)(r | (g << 5) | (b << 10) | (texel & 0x8000)));
     }
@@ -486,7 +492,7 @@ static inline __attribute__((always_inline)) void tex_span_body(
         if (!modulate && !gouraud) {
             if (semi && (texel & 0x8000)) {
                 *dst = blend5551(*dst, texel & 0x1F, (texel >> 5) & 0x1F,
-                                 (texel >> 10) & 0x1F, abr) | mor;
+                                 (texel >> 10) & 0x1F, abr) | 0x8000 | mor;
             } else {
                 *dst = texel | mor;
             }
@@ -495,7 +501,7 @@ static inline __attribute__((always_inline)) void tex_span_body(
         if (gouraud && r8 == 0x80 && g8 == 0x80 && b8 == 0x80) {
             if (semi && (texel & 0x8000)) {
                 *dst = blend5551(*dst, texel & 0x1F, (texel >> 5) & 0x1F,
-                                 (texel >> 10) & 0x1F, abr) | mor;
+                                 (texel >> 10) & 0x1F, abr) | 0x8000 | mor;
             } else {
                 *dst = texel | mor;
             }
@@ -505,7 +511,7 @@ static inline __attribute__((always_inline)) void tex_span_body(
         const int g = mod5((texel >> 5) & 0x1F, g8);
         const int b = mod5((texel >> 10) & 0x1F, b8);
         if (semi && (texel & 0x8000)) {
-            *dst = blend5551(*dst, r, g, b, abr) | mor;
+            *dst = blend5551(*dst, r, g, b, abr) | 0x8000 | mor;
         } else {
             *dst = (u16)(r | (g << 5) | (b << 10) | (texel & 0x8000)) | mor;
         }
