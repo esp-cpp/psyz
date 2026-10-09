@@ -121,6 +121,11 @@ static void clut_cache_flush(void) {
         clut_cache_key[i] = 0xFFFF;
     }
 }
+#ifdef ESP_PLATFORM
+/* for save states: the cache memory is this run's, its contents stale */
+void** Draw_ClutCacheSlot(void) { return (void**)&clut_cache; }
+void Draw_FlushCaches(void) { clut_cache_flush(); }
+#endif
 static inline const u16* clut_cached(u16 id, const u16* src, int n) {
 #ifdef ESP_PLATFORM
     if (!clut_cache) {

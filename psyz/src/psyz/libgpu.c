@@ -178,6 +178,24 @@ void Psyz_GpuWorkerStart(void) {
     printf("[gpu] raster worker on core 1 (prio 4), %d-word queues x2\n", QUEUE_CAP);
 }
 
+/* --- save states (ESP): the worker and the CLUT cache belong to this run -- */
+void Mgs_SnapshotPreserve(void* p, size_t n);
+void** Draw_ClutCacheSlot(void);
+void Draw_FlushCaches(void);
+void Psyz_GpuSnapshotSetup(void) {
+    Mgs_SnapshotPreserve(&raster_task, sizeof raster_task);
+    Mgs_SnapshotPreserve(&raster_done, sizeof raster_done);
+    Mgs_SnapshotPreserve(Draw_ClutCacheSlot(), sizeof(void*));
+}
+void Psyz_GpuAfterRestore(void) {
+    raster_busy = 0;
+    enqueue_in_progress = 0;
+    queue_len = 0;
+    fill_idx = 0;
+    queue_buf = queue_bufs[0];
+    Draw_FlushCaches();
+}
+
 void Psyz_GpuWorkerStop(void) {
     if (!raster_task) {
         return;
