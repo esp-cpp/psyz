@@ -70,16 +70,31 @@ int psyz_queue_canary_hi;
 #include "freertos/semphr.h"
 #include "freertos/idf_additions.h"
 #include "esp_heap_caps.h"
+#include "esp_cpu.h"
 PSYZ_ESP_XRAM static u_long queue_bufs[2][QUEUE_CAP];
 static u_long* queue_buf = queue_bufs[0];
 static int fill_idx;
 static u_long* exec_buf;
 static int exec_len;
-static volatile int raster_busy;
+static volatile int raster_busy; /* workers still on the current batch */
 static volatile int enqueue_in_progress;
-static TaskHandle_t raster_task;
+static TaskHandle_t raster_task;  /* core 1: the top band, or the whole frame */
+static TaskHandle_t raster_task0; /* core 0: the bottom band, when the game is idle */
 static SemaphoreHandle_t raster_done;
-static int psyz_exec_queue(u_long* queue_buf, int queue_len);
+static int exec_workers;          /* 1 or 2 for the batch in flight */
+static int queue_has_move;        /* a VRAM-to-VRAM move or read: one worker only */
+extern int psyz_fb_texture_seen;  /* soft_raster: a frame-buffer texture was sampled */
+static int fb_texture_frames;     /* ... keep to one worker for a few frames */
+unsigned psyz_prof_single_batches, psyz_prof_dual_batches;
+/* Where the bands split: adapted after every dual batch from the two workers'
+ * wall times (core 0's includes the game preempting it) so the cores finish
+ * together. Start biased to core 1 since core 0 runs the game too. */
+static int raster_split_row = 136;
+static int batch_split_row;       /* the split the batch in flight uses */
+static unsigned exec_us_c[2];     /* wall time of each worker's last run */
+unsigned psyz_prof_exeq0_us;      /* core 0 worker time, for the telemetry */
+int psyz_raster_split_row;        /* telemetry copy */
+static int psyz_exec_queue(u_long* queue_buf, int queue_len, int y0, int y1);
 #else
 static int queue_len = 0;
 static u_long queue_buf[QUEUE_CAP];
@@ -87,8 +102,7 @@ static u_long queue_buf[QUEUE_CAP];
 #ifdef ESP_PLATFORM
 /* rough phase timing: where does the frame actually go? */
 unsigned psyz_prof_exeq_us, psyz_prof_load_us, psyz_prof_load_n;
-unsigned psyz_prim_by_code[8];
-static long long psyz_prof_t0;
+#include "psyz_prof.h"
 #endif
 #ifdef ESP_PLATFORM
 extern unsigned sotn_move_count, sotn_exeque_count;
@@ -109,7 +123,7 @@ int Psyz_GpuExeque() {
         return 0;
     }
     if (!raster_task) {
-        psyz_exec_queue(queue_buf, queue_len);
+        psyz_exec_queue(queue_buf, queue_len, 0, VRAM_H - 1);
         queue_len = 0;
         return 0;
     }
@@ -125,8 +139,35 @@ int Psyz_GpuExeque() {
     fill_idx ^= 1;
     queue_buf = queue_bufs[fill_idx];
     queue_len = 0;
-    raster_busy = 1;
+    if (psyz_fb_texture_seen) {
+        psyz_fb_texture_seen = 0;
+        fb_texture_frames = 4;
+    } else if (fb_texture_frames > 0) {
+        fb_texture_frames--;
+    }
+    exec_workers = (raster_task0 && !queue_has_move && fb_texture_frames == 0) ? 2 : 1;
+    queue_has_move = 0;
+    if (exec_workers == 2) {
+        /* rebalance on the previous dual batch's times, a few rows at a time */
+        if (exec_us_c[1] > exec_us_c[0] + 1000u && raster_split_row > 48) {
+            raster_split_row -= 4;
+        } else if (exec_us_c[0] > exec_us_c[1] + 1000u && raster_split_row < 208) {
+            raster_split_row += 4;
+        }
+        exec_us_c[0] = exec_us_c[1] = 0;
+    }
+    batch_split_row = raster_split_row;
+    psyz_raster_split_row = raster_split_row;
+    if (exec_workers == 2) {
+        psyz_prof_dual_batches++;
+    } else {
+        psyz_prof_single_batches++;
+    }
+    raster_busy = exec_workers;
     xTaskNotifyGive(raster_task);
+    if (exec_workers == 2) {
+        xTaskNotifyGive(raster_task0);
+    }
     enqueue_in_progress = 0;
     return 0;
 }
@@ -148,15 +189,21 @@ static int Psyz_GpuPoll(void) {
 }
 
 static void psyz_raster_task(void* arg) {
-    (void)arg;
+    const int core = (int)(intptr_t)arg;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         if (!raster_busy) {
             continue; /* a stray wake: nothing was handed over */
         }
-        psyz_exec_queue(exec_buf, exec_len);
-        raster_busy = 0;
-        xSemaphoreGive(raster_done);
+        if (core == 1) {
+            psyz_exec_queue(exec_buf, exec_len, 0,
+                            exec_workers == 2 ? batch_split_row - 1 : VRAM_H - 1);
+        } else {
+            psyz_exec_queue(exec_buf, exec_len, batch_split_row, VRAM_H - 1);
+        }
+        if (__atomic_sub_fetch(&raster_busy, 1, __ATOMIC_SEQ_CST) == 0) {
+            xSemaphoreGive(raster_done);
+        }
     }
 }
 
@@ -168,14 +215,29 @@ void Psyz_GpuWorkerStart(void) {
         raster_done = xSemaphoreCreateBinary();
     }
     raster_busy = 0;
+    {
+        /* the span-loop micro-benchmark, once, before the game loads any
+         * texture (a constructor is too early for the console) */
+        void Draw_Benchmark(void);
+        Draw_Benchmark();
+    }
     if (xTaskCreatePinnedToCoreWithCaps(psyz_raster_task, "psyz_raster", 8192,
-                                        NULL, 4, &raster_task, 1,
+                                        (void*)1, 4, &raster_task, 1,
                                         MALLOC_CAP_SPIRAM) != pdPASS) {
         raster_task = NULL;
         printf("[gpu] no raster worker: drawing stays on the game core\n");
         return;
     }
-    printf("[gpu] raster worker on core 1 (prio 4), %d-word queues x2\n", QUEUE_CAP);
+    /* the second worker: below the game threads (5) so it only takes the
+     * time core 0 would otherwise idle while the game waits for the frame */
+    if (xTaskCreatePinnedToCoreWithCaps(psyz_raster_task, "psyz_raster0", 8192,
+                                        (void*)0, 4, &raster_task0, 0,
+                                        MALLOC_CAP_SPIRAM) != pdPASS) {
+        raster_task0 = NULL;
+        printf("[gpu] no second raster worker: core 1 draws everything\n");
+    }
+    printf("[gpu] raster workers on both cores (prio 4), split starts at row %d, %d-word queues x2\n",
+           raster_split_row, QUEUE_CAP);
 }
 
 /* --- save states (ESP): the worker and the CLUT cache belong to this run -- */
@@ -184,8 +246,13 @@ void** Draw_ClutCacheSlot(void);
 void Draw_FlushCaches(void);
 void Psyz_GpuSnapshotSetup(void) {
     Mgs_SnapshotPreserve(&raster_task, sizeof raster_task);
+    Mgs_SnapshotPreserve(&raster_task0, sizeof raster_task0);
     Mgs_SnapshotPreserve(&raster_done, sizeof raster_done);
-    Mgs_SnapshotPreserve(Draw_ClutCacheSlot(), sizeof(void*));
+    Mgs_SnapshotPreserve(Draw_ClutCacheSlot(), 2 * sizeof(void*));
+    {
+        void** Draw_TiledSlot(void);
+        Mgs_SnapshotPreserve(Draw_TiledSlot(), sizeof(void*));
+    }
 }
 void Psyz_GpuAfterRestore(void) {
     raster_busy = 0;
@@ -203,22 +270,31 @@ void Psyz_GpuWorkerStop(void) {
     Psyz_GpuSync();
     vTaskDeleteWithCaps(raster_task);
     raster_task = NULL;
+    if (raster_task0) {
+        vTaskDeleteWithCaps(raster_task0);
+        raster_task0 = NULL;
+    }
     vSemaphoreDelete(raster_done);
     raster_done = NULL;
     raster_busy = 0;
 }
 
 volatile int psyz_trace_env; /* frames of E5/E6 tracing left (set by the game) */
-static int psyz_exec_queue(u_long* queue_buf, int queue_len) {
+void Draw_SetBand(int y0, int y1);
+static int psyz_exec_queue(u_long* queue_buf, int queue_len, int band_y0, int band_y1) {
     RECT rect;
     unsigned int x, y;
-    sotn_exeque_count++;
-    if (psyz_trace_env > 0) {
-        printf("[env] --- queue of %d words ---\n", queue_len);
-        psyz_trace_env--;
+    extern long long esp_timer_get_time(void);
+    const long long exec_t0 = esp_timer_get_time();
+    const int core = (int)esp_cpu_get_core_id();
+    if (core == 1) {
+        sotn_exeque_count++;
+        if (psyz_trace_env > 0) {
+            printf("[env] --- queue of %d words ---\n", queue_len);
+            psyz_trace_env--;
+        }
     }
-    { extern long long esp_timer_get_time(void);
-      psyz_prof_t0 = esp_timer_get_time(); }
+    Draw_SetBand(band_y0, band_y1);
 #else
 int Psyz_GpuExeque() {
     RECT rect;
@@ -339,9 +415,8 @@ int Psyz_GpuExeque() {
                 {
                     /* census of what actually reaches the rasterizer, and
                      * the screen coords of the first few polys */
-                    extern unsigned psyz_prim_by_code[8];
                     static int shown = 8;
-                    psyz_prim_by_code[(code >> 4) & 7]++;
+                    psyz_prof_c[core].prim_by_code[(code >> 4) & 7]++;
                     if (shown > 0 && code >= 0x20 && code < 0x40) {
                         shown--;
                         const short* w = (const short*)&queue_buf[i + 1];
@@ -477,8 +552,16 @@ int Psyz_GpuExeque() {
     Draw_FlushBuffer();
     Draw_ExequeSync();
 #ifdef ESP_PLATFORM
-    { extern long long esp_timer_get_time(void);
-      psyz_prof_exeq_us += (unsigned)(esp_timer_get_time() - psyz_prof_t0); }
+    Draw_SetBand(0, VRAM_H - 1);
+    {
+        const unsigned us = (unsigned)(esp_timer_get_time() - exec_t0);
+        exec_us_c[core] = us;
+        if (core == 1) {
+            psyz_prof_exeq_us += us;
+        } else {
+            psyz_prof_exeq0_us += us;
+        }
+    }
 #else
     queue_len = 0;
 #endif
@@ -538,6 +621,15 @@ static int GPU_Enqueue(u_long p1, u_long p2) {
         prev_env = env;
 #ifdef ESP_PLATFORM
         walked++;
+        {
+            /* a MoveImage / DR_MOVE packet (0x01 cache clear then 0x80) or a
+             * StoreImage (0xC0): VRAM-to-VRAM work that one worker must do
+             * before the other draws from it -> this batch runs single */
+            const int c0 = (int)(getcode(env) & 0xFF);
+            if ((c0 == 0x01 && env->len > 2) || c0 == 0xC0) {
+                queue_has_move = 1;
+            }
+        }
         if ((getcode(env) & 0xFF) == 0 && env->len > 2) { /* 0x01 (cache clear) heads a MoveImage */
             // a multi-word packet with command byte 0: not a legal prim.
             // Its ADDRESS names the producer via the symbol table.

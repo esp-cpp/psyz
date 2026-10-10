@@ -74,11 +74,16 @@ bool InitPlatform() {
 }
 
 void Draw_Reset() {
-    st.x0 = 0;
-    st.y0 = 0;
-    st.x1 = VRAM_W - 1;
-    st.y1 = VRAM_H - 1;
-    st.ox = st.oy = 0;
+    for (int c = 0; c < 2; c++) {
+        SoftState* s = &st_c[c];
+        s->x0 = 0;
+        s->y0 = 0;
+        s->x1 = VRAM_W - 1;
+        s->y1 = VRAM_H - 1;
+        s->ox = s->oy = 0;
+        s->area_y0 = s->band_y0 = 0;
+        s->area_y1 = s->band_y1 = VRAM_H - 1;
+    }
     if (!vram) {
         vram = SOFT_VRAM;
     }

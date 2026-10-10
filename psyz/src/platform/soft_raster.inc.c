@@ -22,7 +22,22 @@
 #define EXTRA_VERTEX 0x08
 #define GOURAUD 0x10
 #define TRIANGLE 0x20
-static unsigned short cur_tpage = 0;
+/* Two rasterizer workers (one per core) execute the same command stream over
+ * different bands of rows, so every piece of drawing state is per core:
+ * the draw area and offset, the mask, the texpage mode, the CLUT cache. */
+#ifdef ESP_PLATFORM
+#include "esp_cpu.h"
+static inline int soft_core(void) { return (int)esp_cpu_get_core_id(); }
+#else
+static inline int soft_core(void) { return 0; }
+#endif
+static unsigned short cur_tpage_c[2];
+#define cur_tpage cur_tpage_c[soft_core()]
+#ifdef ESP_PLATFORM
+#include "psyz_prof.h"
+PsyzProf psyz_prof_c[2];
+#define PROFC (psyz_prof_c[soft_core()])
+#endif
 static short s11(short v) { return (short)(((v & 0x7FF) ^ 1024) - 1024); }
 #ifndef WARNF
 #define WARNF(...)
@@ -55,17 +70,128 @@ static u16 soft_vram_fallback[VRAM_H * VRAM_W];
 
 static u16* vram; // resolved once in InitPlatform
 
+#ifdef SOFT_TILED_TEX
+/* Texture fetches read a tiled shadow of VRAM instead of VRAM itself.
+ * VRAM is linear, 2 KB per row: a texture walked along v touches a new cache
+ * line for every texel, and on this board that line change costs ~125
+ * cycles whether the page is warm or cold (measured: 60 cy/px along u,
+ * 185 along v). The shadow stores 8x8-halfword tiles (128 B, one L2 line),
+ * so a line holds an 8-row block of texels and the v walk changes lines
+ * once per 8 texels. The shadow is rebuilt lazily: every VRAM write marks
+ * its 64-halfword x 256-row regions dirty (one bit each, 32 regions), and
+ * tex_from re-tiles the dirty regions a page covers before the primitive is
+ * drawn. Both rasterizer workers share the dirty word atomically; two
+ * workers re-tiling the same region write identical bytes. */
+#include <stdlib.h>
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#endif
+static u16* vram_tiled;
+/* dirty regions: 64 halfwords x 32 rows, bit (row * 16 + col), row = y >> 5,
+ * col = x >> 6; 256 bits in 8 words, a word per pair of rows. Small, because
+ * the game redraws parts of the texture area every frame (the radar, the
+ * movie strips) and whatever is dirty is re-copied by the next primitive
+ * that samples it. */
+static volatile uint32_t tex_dirty[8] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+#define TEX_HW(tbase, page, hx, v) \
+    vram_tiled[(tbase) + (((v) >> 3) << 13) + (((hx) >> 3) << 6) + (((v) & 7) << 3) + ((hx) & 7)]
+static inline void tex_mark_dirty(int x0, int y0, int x1, int y1) {
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > VRAM_W - 1) x1 = VRAM_W - 1;
+    if (y1 > VRAM_H - 1) y1 = VRAM_H - 1;
+    if (x0 > x1 || y0 > y1) {
+        return;
+    }
+    const uint32_t m16 = (2u << (x1 >> 6)) - (1u << (x0 >> 6));
+    for (int r = y0 >> 5; r <= (y1 >> 5); r++) {
+        const uint32_t m = m16 << ((r & 1) * 16);
+        if ((tex_dirty[r >> 1] & m) != m) {
+            __atomic_fetch_or(&tex_dirty[r >> 1], m, __ATOMIC_RELAXED);
+        }
+    }
+}
+static void tex_retile_region(int col, int row) {
+#ifdef ESP_PLATFORM
+    const uint32_t t0 = esp_cpu_get_cycle_count();
+#endif
+    for (int y = row * 32; y < row * 32 + 32; y++) {
+        const uint32_t* src = (const uint32_t*)(vram + y * VRAM_W + col * 64);
+        uint32_t* dst = (uint32_t*)(vram_tiled + ((y >> 3) << 13) + ((col * 8) << 6) + ((y & 7) << 3));
+        for (int tx = 0; tx < 8; tx++, src += 4, dst += 32) {
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst[2] = src[2];
+            dst[3] = src[3];
+        }
+    }
+#ifdef ESP_PLATFORM
+    PROFC.retile_cy += esp_cpu_get_cycle_count() - t0;
+    PROFC.retile_n++;
+#endif
+}
+/* re-tile the dirty regions a page (ncols columns, 256 rows from py) covers.
+ * The bits are cleared first, then copied: a write that lands during the
+ * copy re-marks the region and it is re-tiled next time, never missed. */
+static inline void tex_sync_page(int px, int py, int ncols) {
+    uint32_t cm = ((1u << ncols) - 1) << (px >> 6);
+    const uint32_t m16 = (cm | (cm >> 16)) & 0xFFFFu;
+    const uint32_t need = m16 | (m16 << 16);
+    const int w0 = py >> 6; /* 2 rows of 32 per word: 4 words per 256 rows */
+    for (int w = w0; w < w0 + 4; w++) {
+        if (tex_dirty[w] & need) {
+            uint32_t bits = __atomic_fetch_and(&tex_dirty[w], ~need, __ATOMIC_ACQ_REL) & need;
+            while (bits) {
+                const int b = __builtin_ctz(bits);
+                bits &= bits - 1;
+                tex_retile_region(b & 15, w * 2 + (b >> 4));
+            }
+        }
+    }
+}
+static inline void tex_dirty_all(void) {
+    for (int w = 0; w < 8; w++) {
+        tex_dirty[w] = ~0u;
+    }
+}
+void Draw_TiledInit(void) {
+    if (!vram_tiled) {
+        vram_tiled = heap_caps_malloc((size_t)VRAM_W * VRAM_H * sizeof(u16), MALLOC_CAP_SPIRAM);
+        if (!vram_tiled) {
+            printf("[soft] no PSRAM for the tiled texture shadow\n");
+            abort();
+        }
+    }
+    tex_dirty_all();
+}
+void** Draw_TiledSlot(void) { return (void**)&vram_tiled; } /* for save states */
+#else
+#define TEX_HW(tbase, page, hx, v) (page)[((v) << 10) + (hx)]
+#define tex_mark_dirty(x0, y0, x1, y1) ((void)0)
+void Draw_TiledInit(void) {}
+static void* tiled_none;
+void** Draw_TiledSlot(void) { return &tiled_none; }
+#endif
+
 typedef struct {
-    int x0, y0, x1, y1; // draw area, inclusive
+    int x0, y0, x1, y1; // effective clip, inclusive: draw area within the band
     int ox, oy;         // draw offset
     // GP0 E6, the mask bit: mask_or is 0x8000 while "set mask bit on drawn
-    // pixels" is on; mask_check skips pixels whose bit 15 is set. Effects
-    // that reuse the frame as a texture depend on the first (a black pixel
-    // written as 0x8000 is not the never-drawn texel 0x0000).
+    // pixels" is on; mask_check skips pixels whose bit 15 is set.
     u16 mask_or;
     int mask_check;
+    int area_y0, area_y1; // the draw area as set by E3/E4
+    int band_y0, band_y1; // this worker's rows
 } SoftState;
-static SoftState st = {0, 0, VRAM_W - 1, VRAM_H - 1, 0, 0, 0, 0};
+static SoftState st_c[2] = {
+    {0, 0, VRAM_W - 1, VRAM_H - 1, 0, 0, 0, 0, 0, VRAM_H - 1, 0, VRAM_H - 1},
+    {0, 0, VRAM_W - 1, VRAM_H - 1, 0, 0, 0, 0, 0, VRAM_H - 1, 0, VRAM_H - 1},
+};
+#define st st_c[soft_core()]
+/* a frame that samples the frame buffer as a texture (the zoom blur, the
+ * water refraction) must be drawn by one worker: the other band's rows may
+ * not be there yet */
+int psyz_fb_texture_seen;
 
 // every pixel write goes through this: honours both mask modes
 #define MASK_WRITE(dstp, val)                                                  \
@@ -108,14 +234,17 @@ typedef struct {
  * fragment covering the archive); the cache is the one thing that must be
  * internal, so it is taken from the internal heap on first use */
 #include "esp_heap_caps.h"
-static u16 (*clut_cache)[256];
+static u16 (*clut_cache_c[2])[256];
+#define clut_cache clut_cache_c[soft_core()]
 #else
 static u16 clut_cache_storage[8][256];
 #define clut_cache clut_cache_storage
 #endif
-static u16 clut_cache_key[8] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
-                                0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
-static u8 clut_cache_next;
+static u16 clut_cache_key_c[2][8] = {{0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF},
+                                     {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF}};
+#define clut_cache_key clut_cache_key_c[soft_core()]
+static u8 clut_cache_next_c[2];
+#define clut_cache_next clut_cache_next_c[soft_core()]
 static void clut_cache_flush(void) {
     for (int i = 0; i < 8; i++) {
         clut_cache_key[i] = 0xFFFF;
@@ -123,8 +252,17 @@ static void clut_cache_flush(void) {
 }
 #ifdef ESP_PLATFORM
 /* for save states: the cache memory is this run's, its contents stale */
-void** Draw_ClutCacheSlot(void) { return (void**)&clut_cache; }
-void Draw_FlushCaches(void) { clut_cache_flush(); }
+void** Draw_ClutCacheSlot(void) { return (void**)clut_cache_c; } /* both cores' */
+void Draw_FlushCaches(void) {
+#ifdef SOFT_TILED_TEX
+    tex_dirty_all();
+#endif
+    for (int c = 0; c < 2; c++) {
+        for (int i = 0; i < 8; i++) {
+            clut_cache_key_c[c][i] = 0xFFFF;
+        }
+    }
+}
 #endif
 static inline const u16* clut_cached(u16 id, const u16* src, int n) {
 #ifdef ESP_PLATFORM
@@ -198,6 +336,7 @@ typedef struct {
     const u16* clut;  // 16 or 256 entries
     int bpp;          // 0=4bpp, 1=8bpp, 2=15bpp
     int abr;          // semi-transparency mode from the tpage
+    int tbase;        // tiled shadow: halfword index of the page's first tile
 } Tex;
 
 static inline Tex tex_from(u16 tpage, u16 clut) {
@@ -206,6 +345,14 @@ static inline Tex tex_from(u16 tpage, u16 clut) {
     int py = ((tpage >> 4) & 1) * 256;
     t.page = vram + py * VRAM_W + px;
     t.bpp = (tpage >> 7) & 3;
+    if (t.bpp >= 2 && py == 0 && px < 640) {
+        psyz_fb_texture_seen = 1;
+    }
+    t.tbase = ((py >> 3) << 13) + ((px >> 3) << 6);
+#ifdef SOFT_TILED_TEX
+    /* the page covers 1, 2 or 4 columns of 64 halfwords */
+    tex_sync_page(px, py, 1 << (t.bpp > 2 ? 2 : t.bpp));
+#endif
     t.abr = (tpage >> 5) & 3;
     t.clut = vram + ((clut >> 6) & 0x1FF) * VRAM_W + (clut & 0x3F) * 16;
 #ifdef SOFT_CLUT_CACHE
@@ -221,15 +368,15 @@ static inline u16 tex_fetch(const Tex* t, int u, int v) {
     v &= 0xFF;
     switch (t->bpp) {
     case 0: { // 4bpp: 4 texels per halfword
-        u16 hw = t->page[v * VRAM_W + (u >> 2)];
+        u16 hw = TEX_HW(t->tbase, t->page, u >> 2, v);
         return t->clut[(hw >> ((u & 3) * 4)) & 0xF];
     }
     case 1: { // 8bpp: 2 texels per halfword
-        u16 hw = t->page[v * VRAM_W + (u >> 1)];
+        u16 hw = TEX_HW(t->tbase, t->page, u >> 1, v);
         return t->clut[(hw >> ((u & 1) * 8)) & 0xFF];
     }
     default: // 15bpp direct
-        return t->page[v * VRAM_W + u];
+        return TEX_HW(t->tbase, t->page, u, v);
     }
 }
 
@@ -251,16 +398,22 @@ unsigned psyz_texel_zero, psyz_texel_ok, psyz_flat_px;
  * flat triangles, sprites, tiles, lines */
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
-unsigned psyz_prof_cy[6], psyz_prof_n[6];
+#define psyz_prof_cy PROFC.cy
+#define psyz_prof_n PROFC.n
 /* finer: textured rows, textured pixels, cycles inside the span loops, cycles
  * in tex_from (CLUT cache) */
-unsigned psyz_prof_rows, psyz_prof_px, psyz_prof_span_cy, psyz_prof_texfrom_cy;
+#define psyz_prof_rows PROFC.rows
+#define psyz_prof_px PROFC.px
+#define psyz_prof_span_cy PROFC.span_cy
+#define psyz_prof_texfrom_cy PROFC.texfrom_cy
+#define psyz_tri_off PROFC.tri_off
+#define psyz_tri_tiny PROFC.tri_tiny
+#define psyz_tri_ok PROFC.tri_ok
+#define psyz_tri_huge PROFC.tri_huge
 
 #define PROF_BEGIN() uint32_t prof_t0_ = esp_cpu_get_cycle_count()
 #define PROF_END(k) (psyz_prof_cy[k] += esp_cpu_get_cycle_count() - prof_t0_, psyz_prof_n[k]++)
-unsigned psyz_tri_off, psyz_tri_tiny, psyz_tri_ok;
-/* polygons the PSX GPU would have refused for exceeding 1023x511 */
-unsigned psyz_tri_huge;
+/* tri_huge: polygons the PSX GPU would have refused for exceeding 1023x511 */
 #endif
 static inline void put_texel(u16* dst, u16 texel, int r8, int g8, int b8,
                              int semi, int abr) {
@@ -328,13 +481,13 @@ SOFT_RASTER_IRAM static void raster_sprite(const SV* v, int w, int h, u16 tpage,
     if (i0 > i1 || j0 > j1) {
         return;
     }
+    tex_mark_dirty(x0 + i0, y0 + j0, x0 + i1, y0 + j1);
     for (int j = j0; j <= j1; j++) {
         u16* row = vram + (y0 + j) * VRAM_W;
         int tv = (v->v + j) & 0xFF;
         int i = i0;
         if (t.bpp == 0) {
             // 4bpp: one halfword read serves four texels
-            const u16* trow = t.page + tv * VRAM_W;
             // Tilemap fast path: opaque, neutral modulation, u aligned to a
             // halfword. Four texels per source read, pixel pairs written as
             // one 32-bit store. Per-texel semantics are identical to the
@@ -344,7 +497,7 @@ SOFT_RASTER_IRAM static void raster_sprite(const SV* v, int w, int h, u16 tpage,
                 ((v->u + i0) & 3) == 0 && ((i1 - i0) & 3) == 3) {
                 u16* dst = &row[x0 + i0];
                 for (int n = i0; n <= i1; n += 4) {
-                    u16 hw = trow[((v->u + n) & 0xFF) >> 2];
+                    u16 hw = TEX_HW(t.tbase, t.page, ((v->u + n) & 0xFF) >> 2, tv);
                     u16 a = t.clut[hw & 0xF];
                     u16 b = t.clut[(hw >> 4) & 0xF];
                     u16 c = t.clut[(hw >> 8) & 0xF];
@@ -367,7 +520,7 @@ SOFT_RASTER_IRAM static void raster_sprite(const SV* v, int w, int h, u16 tpage,
             }
             while (i <= i1) {
                 int u = (v->u + i) & 0xFF;
-                u16 hw = trow[u >> 2];
+                u16 hw = TEX_HW(t.tbase, t.page, u >> 2, tv);
                 int nib = u & 3;
                 do {
                     put_texel(&row[x0 + i], t.clut[(hw >> (nib * 4)) & 0xF],
@@ -392,6 +545,7 @@ SOFT_RASTER_IRAM static void raster_tile(const SV* v, int w, int h, int semi, in
     int xb = x0 + w - 1 > st.x1 ? st.x1 : x0 + w - 1;
     int ya = y0 < st.y0 ? st.y0 : y0;
     int yb = y0 + h - 1 > st.y1 ? st.y1 : y0 + h - 1;
+    tex_mark_dirty(xa, ya, xb, yb);
 
     /* Opaque fill: nothing to read, nothing to interpolate, one colour for
      * every pixel -- so the general per-pixel path is all overhead. It matters
@@ -452,20 +606,24 @@ typedef struct {
     int32_t ui, vi, udx, vdx;
     int32_t ri, gi, bi, rdx, gdx, bdx;
     int r8, g8, b8;
+    const u16* lut; // flat modulation: [0..31] r, [32..63] g<<5, [64..95] b<<10
 } TexSpan;
 
 static inline __attribute__((always_inline)) void tex_span_body(
     const Tex* t, const TexSpan* sp, const int bpp, const int gouraud,
-    const int semi, const int modulate) {
+    const int semi, const int modulate, const int clamp) {
     u16* __restrict dst = sp->dst;
     const u16* __restrict page = t->page;
+    const int tbase = t->tbase;
+    (void)page;
+    (void)tbase;
     const u16* __restrict clut = t->clut;
     const int abr = t->abr;
     int32_t ui = sp->ui, vi = sp->vi;
     const int32_t udx = sp->udx, vdx = sp->vdx;
     int32_t ri = sp->ri, gi = sp->gi, bi = sp->bi;
     const int32_t rdx = sp->rdx, gdx = sp->gdx, bdx = sp->bdx;
-    const int cr = sp->r8, cg = sp->g8, cb = sp->b8;
+    const u16* __restrict lut = sp->lut;
     const int mchk = st.mask_check;
     const u16 mor = st.mask_or;
     for (int n = sp->n; n > 0; n--, dst++, ui += udx, vi += vdx) {
@@ -473,15 +631,15 @@ static inline __attribute__((always_inline)) void tex_span_body(
         const int v = (vi >> 16) & 0xFF;
         u16 texel;
         if (bpp == 0) {
-            const u16 hw = page[(v << 10) + (u >> 2)];
+            const u16 hw = TEX_HW(tbase, page, u >> 2, v);
             texel = clut[(hw >> ((u & 3) << 2)) & 0xF];
         } else if (bpp == 1) {
-            const u16 hw = page[(v << 10) + (u >> 1)];
+            const u16 hw = TEX_HW(tbase, page, u >> 1, v);
             texel = clut[(hw >> ((u & 1) << 3)) & 0xFF];
         } else {
-            texel = page[(v << 10) + u];
+            texel = TEX_HW(tbase, page, u, v);
         }
-        int r8 = cr, g8 = cg, b8 = cb;
+        int r8 = 0, g8 = 0, b8 = 0;
         if (gouraud) {
             r8 = (int)(ri >> 16);
             g8 = (int)(gi >> 16);
@@ -503,18 +661,29 @@ static inline __attribute__((always_inline)) void tex_span_body(
             }
             continue;
         }
-        if (gouraud && r8 == 0x80 && g8 == 0x80 && b8 == 0x80) {
+        if (!gouraud) {
+            /* flat modulation: the colour is the primitive's, so the three
+             * channel products were tabled once per triangle */
+            const u16 m = lut[texel & 0x1F] | lut[32 + ((texel >> 5) & 0x1F)] |
+                          lut[64 + ((texel >> 10) & 0x1F)];
             if (semi && (texel & 0x8000)) {
-                *dst = blend5551(*dst, texel & 0x1F, (texel >> 5) & 0x1F,
-                                 (texel >> 10) & 0x1F, abr) | 0x8000 | mor;
+                *dst = blend5551(*dst, m & 0x1F, (m >> 5) & 0x1F, (m >> 10) & 0x1F, abr) |
+                       0x8000 | mor;
             } else {
-                *dst = texel | mor;
+                *dst = (u16)(m | (texel & 0x8000)) | mor;
             }
             continue;
         }
-        const int r = mod5(texel & 0x1F, r8);
-        const int g = mod5((texel >> 5) & 0x1F, g8);
-        const int b = mod5((texel >> 10) & 0x1F, b8);
+        /* gouraud: (tex5 * col8) >> 7, clamped to 31 only when some colour on
+         * this span exceeds the neutral 0x80 (the dispatcher checked) */
+        int r = ((texel & 0x1F) * r8) >> 7;
+        int g = (((texel >> 5) & 0x1F) * g8) >> 7;
+        int b = (((texel >> 10) & 0x1F) * b8) >> 7;
+        if (clamp) {
+            if (r > 31) r = 31;
+            if (g > 31) g = 31;
+            if (b > 31) b = 31;
+        }
         if (semi && (texel & 0x8000)) {
             *dst = blend5551(*dst, r, g, b, abr) | 0x8000 | mor;
         } else {
@@ -523,27 +692,189 @@ static inline __attribute__((always_inline)) void tex_span_body(
     }
 }
 
-#define TEX_SPAN_CASE(bpp, g, s, m)                                            \
-    case ((bpp) << 3) | ((g) << 2) | ((s) << 1) | (m):                         \
-        tex_span_body(t, sp, bpp, g, s, m);                                    \
+#define TEX_SPAN_CASE(bpp, g, s, m, c)                                         \
+    case ((c) << 5) | ((bpp) << 3) | ((g) << 2) | ((s) << 1) | (m):            \
+        tex_span_body(t, sp, bpp, g, s, m, c);                                 \
         break;
 #define TEX_SPAN_CASES_BPP(bpp)                                                \
-    TEX_SPAN_CASE(bpp, 0, 0, 0) TEX_SPAN_CASE(bpp, 0, 0, 1)                    \
-    TEX_SPAN_CASE(bpp, 0, 1, 0) TEX_SPAN_CASE(bpp, 0, 1, 1)                    \
-    TEX_SPAN_CASE(bpp, 1, 0, 1) TEX_SPAN_CASE(bpp, 1, 1, 1)
+    TEX_SPAN_CASE(bpp, 0, 0, 0, 0) TEX_SPAN_CASE(bpp, 0, 0, 1, 0)              \
+    TEX_SPAN_CASE(bpp, 0, 1, 0, 0) TEX_SPAN_CASE(bpp, 0, 1, 1, 0)              \
+    TEX_SPAN_CASE(bpp, 1, 0, 1, 0) TEX_SPAN_CASE(bpp, 1, 1, 1, 0)              \
+    TEX_SPAN_CASE(bpp, 1, 0, 1, 1) TEX_SPAN_CASE(bpp, 1, 1, 1, 1)
 
 SOFT_RASTER_IRAM static void tex_span_dispatch(const Tex* t, const TexSpan* sp,
                                                int gouraud, int semi, int modulate) {
     int bpp = t->bpp > 2 ? 2 : t->bpp;
-    if (gouraud) modulate = 1;
-    switch ((bpp << 3) | ((gouraud ? 1 : 0) << 2) | ((semi ? 1 : 0) << 1) | (modulate ? 1 : 0)) {
+    int clamp = 0;
+    if (gouraud) {
+        /* the colour is linear along the span: it exceeds neutral somewhere
+         * only if it does at an end */
+        const int32_t n1 = sp->n - 1;
+        const int32_t lim = 0x81 << 16;
+        modulate = 1;
+        if (sp->ri >= lim || sp->gi >= lim || sp->bi >= lim ||
+            sp->ri + sp->rdx * n1 >= lim || sp->gi + sp->gdx * n1 >= lim ||
+            sp->bi + sp->bdx * n1 >= lim) {
+            clamp = 1;
+        }
+    }
+    const int idx = (clamp << 5) | (bpp << 3) | ((gouraud ? 1 : 0) << 2) |
+                    ((semi ? 1 : 0) << 1) | (modulate ? 1 : 0);
+#ifdef SOFT_RASTER_PROF_SPANS
+    const uint32_t c0 = esp_cpu_get_cycle_count();
+#endif
+    switch (idx) {
         TEX_SPAN_CASES_BPP(0)
         TEX_SPAN_CASES_BPP(1)
         TEX_SPAN_CASES_BPP(2)
     default:
         break;
     }
+#ifdef SOFT_RASTER_PROF_SPANS
+    PROFC.case_cy[idx] += esp_cpu_get_cycle_count() - c0;
+    PROFC.case_px[idx] += (unsigned)sp->n;
+    PROFC.case_rows[idx]++;
+#endif
 }
+
+/* The span's [xl, xr] per row come from the three edge functions. Each edge
+ * bound moves by a fixed rational amount per row, so instead of a hardware
+ * divide per edge per row (three per row, on spans averaging 15 pixels) the
+ * bound is stepped with an integer DDA: quotient and remainder of the same
+ * division, advanced exactly. Output is bit-identical to the divide form. */
+typedef struct {
+    int q, r, dq, dr, A, kind; /* kind 0: left bound, 1: right bound, 2: horizontal edge */
+} EdgeDDA;
+static inline int floordiv_i(int n, int d) {
+    return n >= 0 ? n / d : -((-n + d - 1) / d);
+}
+static inline void edge_dda_init(EdgeDDA* e, int A, int B, int w) {
+    if (A == 0) {
+        e->kind = 2; /* inside iff w >= 0; w moves by B per row */
+        e->q = w;
+        e->dq = B;
+        e->r = e->dr = e->A = 0;
+    } else if (A > 0) {
+        /* x >= minx + ceil(-w / A) = minx + floor((-w + A - 1) / A) */
+        const int n = -w + A - 1;
+        e->kind = 0;
+        e->A = A;
+        e->q = floordiv_i(n, A);
+        e->r = n - e->q * A;
+        e->dq = floordiv_i(-B, A);
+        e->dr = -B - e->dq * A;
+    } else {
+        /* x <= minx + floor(w / -A); a negative quotient means the row is empty */
+        const int Ap = -A;
+        e->kind = 1;
+        e->A = Ap;
+        e->q = floordiv_i(w, Ap);
+        e->r = w - e->q * Ap;
+        e->dq = floordiv_i(B, Ap);
+        e->dr = B - e->dq * Ap;
+    }
+}
+/* the row's span, then advance all three edges to the next row; 0 if empty */
+static inline int edge_row(EdgeDDA* ed, int minx, int maxx, int* pxl, int* pxr) {
+    int xl = minx, xr = maxx, ok = 1;
+    for (int i = 0; i < 3; i++) {
+        EdgeDDA* e = &ed[i];
+        if (e->kind == 2) {
+            if (e->q < 0) ok = 0;
+            e->q += e->dq;
+            continue;
+        }
+        const int x = minx + e->q;
+        if (e->kind == 0) {
+            if (x > xl) xl = x;
+        } else {
+            if (x < xr) xr = x;
+        }
+        e->q += e->dq;
+        e->r += e->dr;
+        if (e->r >= e->A) {
+            e->r -= e->A;
+            e->q++;
+        }
+    }
+    *pxl = xl;
+    *pxr = xr;
+    return ok && xl <= xr;
+}
+
+#ifdef ESP_PLATFORM
+/* Startup micro-benchmark of the textured span loop: the same 4bpp modulated
+ * span over texture pages in PSRAM (one page, warm in the cache; 16 pages
+ * cycling, 512 KB footprint, cold) and in internal RAM, walking the texture
+ * along u (one cache line per 128 texels), along v (a new 2 KB row per
+ * texel) and diagonally; destination rows in PSRAM, cold or warm. Separates
+ * memory stalls from arithmetic without a cycle-accurate profiler. Reads
+ * whatever VRAM holds (the CLUT has no zero entry so every texel is drawn);
+ * writes rows 256.. of VRAM, so it runs once, before the game loads anything. */
+static u16 bench_clut[16] __attribute__((aligned(64)));
+static unsigned bench_run(const Tex* pages, int npages, u16* dst_base, int dst_cold,
+                          int32_t udx, int32_t vdx, int vmask, int gouraud, int modulate) {
+    TexSpan sp;
+    const int n = 32, spans = 2048;
+    static u16 bench_lut[96];
+    for (int i = 0; i < 32; i++) {
+        bench_lut[i] = (u16)mod5(i, 0x90);
+        bench_lut[32 + i] = (u16)(mod5(i, 0x90) << 5);
+        bench_lut[64 + i] = (u16)(mod5(i, 0x90) << 10);
+    }
+    memset(&sp, 0, sizeof sp);
+    sp.lut = bench_lut;
+    sp.udx = udx;
+    sp.vdx = vdx;
+    sp.n = n;
+    sp.r8 = sp.g8 = sp.b8 = modulate ? 0x90 : 0x80;
+    sp.ri = sp.gi = sp.bi = 0x90 << 16;
+    sp.rdx = sp.gdx = sp.bdx = -(1 << 12);
+    const uint32_t t0 = esp_cpu_get_cycle_count();
+    for (int s = 0; s < spans; s++) {
+        sp.dst = dst_cold ? dst_base + (s & 255) * VRAM_W + ((s >> 8) & 7) * 64 : dst_base;
+        sp.ui = ((s * 37) & 0xFF) << 16;
+        sp.vi = ((s * 11) & vmask) << 16;
+        tex_span_dispatch(&pages[s % npages], &sp, gouraud, 0, modulate);
+    }
+    return (esp_cpu_get_cycle_count() - t0) / (unsigned)(n * spans);
+}
+void Draw_Benchmark(void) {
+    static int done;
+    if (done || !vram) {
+        return;
+    }
+    done = 1;
+    for (int i = 0; i < 16; i++) {
+        bench_clut[i] = (u16)(0x4210 + i * 0x421);
+    }
+    Tex pages[16];
+    for (int i = 0; i < 16; i++) {
+        pages[i].page = vram + (i & 15) * 64;
+        pages[i].clut = bench_clut;
+        pages[i].bpp = 0;
+        pages[i].abr = 0;
+        pages[i].tbase = ((i & 15) * 64 >> 3) << 6;
+    }
+    u16* dst = vram + 256 * VRAM_W;
+    const int32_t one = 1 << 16;
+    printf("[bench] 4bpp modulated span, cycles/px: psram page warm: u %u v %u diag %u\n",
+           bench_run(pages, 1, dst, 0, one, 0, 0xFF, 0, 1),
+           bench_run(pages, 1, dst, 0, 0, one, 0xFF, 0, 1),
+           bench_run(pages, 1, dst, 0, one, one, 0xFF, 0, 1));
+    printf("[bench] psram 16 pages cold, dst cold: u %u v %u diag %u | plain u %u gouraud u %u\n",
+           bench_run(pages, 16, dst, 1, one, 0, 0xFF, 0, 1),
+           bench_run(pages, 16, dst, 1, 0, one, 0xFF, 0, 1),
+           bench_run(pages, 16, dst, 1, one, one, 0xFF, 0, 1),
+           bench_run(pages, 16, dst, 1, one, 0, 0xFF, 0, 0),
+           bench_run(pages, 16, dst, 1, one, 0, 0xFF, 1, 1));
+    printf("[bench] psram 16 pages cold, dst warm: u %u v %u | 1 page warm, dst cold: u %u v %u\n",
+           bench_run(pages, 16, dst, 0, one, 0, 0xFF, 0, 1),
+           bench_run(pages, 16, dst, 0, 0, one, 0xFF, 0, 1),
+           bench_run(pages, 1, dst, 1, one, 0, 0xFF, 0, 1),
+           bench_run(pages, 1, dst, 1, 0, one, 0xFF, 0, 1));
+}
+#endif
 #undef TEX_SPAN_CASE
 #undef TEX_SPAN_CASES_BPP
 
@@ -592,7 +923,6 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     {
         /* classify: is the world missing because it lands outside the screen,
          * or because it projects to sub-pixel size? */
-        extern unsigned psyz_tri_off, psyz_tri_tiny, psyz_tri_ok;
         if (maxx < st.x0 || minx > st.x1 || maxy < st.y0 || miny > st.y1) {
             psyz_tri_off++;
         } else if ((maxx - minx) < 2 && (maxy - miny) < 2) {
@@ -624,7 +954,6 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
      * property being tested. */
     if ((maxx - minx) > 1023 || (maxy - miny) > 511) {
 #ifdef ESP_PLATFORM
-        extern unsigned psyz_tri_huge;
         psyz_tri_huge++;
 #endif
         return;
@@ -637,6 +966,7 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     if (minx > maxx || miny > maxy) {
         return;
     }
+    tex_mark_dirty(minx, miny, maxx, maxy);
 
     // edge setup: E(x,y) >= 0 inside, top-left edges get the <0 bias on the
     // others so shared edges paint exactly once
@@ -663,6 +993,18 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     int w0row = A0 * minx + B0 * miny + C0 + bias0;
     int w1row = A1 * minx + B1 * miny + C1 + bias1;
     int w2row = A2 * minx + B2 * miny + C2 + bias2;
+    EdgeDDA edges[3];
+    edge_dda_init(&edges[0], A0, B0, w0row);
+    edge_dda_init(&edges[1], A1, B1, w1row);
+    edge_dda_init(&edges[2], A2, B2, w2row);
+    u16 mod_lut[96];
+    if (textured && tex_mode && !gouraud) {
+        for (int i = 0; i < 32; i++) {
+            mod_lut[i] = (u16)mod5(i, a->r);
+            mod_lut[32 + i] = (u16)(mod5(i, a->g) << 5);
+            mod_lut[64 + i] = (u16)(mod5(i, a->b) << 10);
+        }
+    }
 
     // Per-triangle attribute gradients, 16.16 fixed point. Xtensa has no fast
     // divider, and the first-correctness version paid 3-5 integer divisions
@@ -763,28 +1105,9 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
         fx frdx = gouraud ? rdx : 0, frdy = gouraud ? rdy : 0;
         fx fgdx = gouraud ? gdx : 0, fgdy = gouraud ? gdy : 0;
         fx fbdx = gouraud ? bdx : 0, fbdy = gouraud ? bdy : 0;
-        for (int y = miny; y <= maxy; y++, w0row += B0, w1row += B1,
-                 w2row += B2, r0 += frdy, g0 += fgdy, b0 += fbdy) {
-            int xl = minx, xr = maxx;
-            int we[3] = {w0row, w1row, w2row};
-            int Ae[3] = {A0, A1, A2};
-            int empty = 0;
-            for (int e = 0; e < 3; e++) {
-                int w = we[e], A = Ae[e];
-                if (A == 0) {
-                    if (w < 0) { empty = 1; break; }
-                } else if (A > 0) {
-                    if (w < 0) {
-                        int x = minx + (-w + A - 1) / A;
-                        if (x > xl) xl = x;
-                    }
-                } else {
-                    if (w < 0) { empty = 1; break; }
-                    int x = minx + w / (-A);
-                    if (x < xr) xr = x;
-                }
-            }
-            if (empty || xl > xr) {
+        for (int y = miny; y <= maxy; y++, r0 += frdy, g0 += fgdy, b0 += fbdy) {
+            int xl, xr;
+            if (!edge_row(edges, minx, maxx, &xl, &xr)) {
                 continue;
             }
             fx ri = r0 + (fx)(xl - minx) * frdx;
@@ -822,31 +1145,11 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     // accumulators and no accept test - just attribute stepping + the pixel
     // write. Identical stepping start (xl offset from minx) keeps output
     // bit-exact with the per-pixel-test form.
-    for (int y = miny; y <= maxy; y++, w0row += B0, w1row += B1, w2row += B2,
-             rrow += rdy, grow += gdy, brow += bdy, urow += udy, vrow += vdy) {
-        int xl = minx, xr = maxx;
-        {
-            int we[3] = {w0row, w1row, w2row};
-            int Ae[3] = {A0, A1, A2};
-            int empty = 0;
-            for (int e = 0; e < 3; e++) {
-                int w = we[e], A = Ae[e];
-                if (A == 0) {
-                    if (w < 0) { empty = 1; break; }
-                } else if (A > 0) {
-                    if (w < 0) {
-                        int x = minx + (-w + A - 1) / A;
-                        if (x > xl) xl = x;
-                    }
-                } else {
-                    if (w < 0) { empty = 1; break; }
-                    int x = minx + w / (-A);
-                    if (x < xr) xr = x;
-                }
-            }
-            if (empty || xl > xr) {
-                continue;
-            }
+    for (int y = miny; y <= maxy; y++, rrow += rdy, grow += gdy, brow += bdy,
+             urow += udy, vrow += vdy) {
+        int xl, xr;
+        if (!edge_row(edges, minx, maxx, &xl, &xr)) {
+            continue;
         }
         fx ri = rrow + (fx)(xl - minx) * rdx;
         fx gi = grow + (fx)(xl - minx) * gdx;
@@ -858,8 +1161,8 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
             // one specialised loop per (bpp, shading, blending) combination:
             // every test the generic loop made per pixel is made once here
             TexSpan sp = {row + xl, xr - xl + 1, ui, vi, udx, vdx,
-                          ri, gi, bi, rdx, gdx, bdx, a->r, a->g, a->b};
-#ifdef ESP_PLATFORM
+                          ri, gi, bi, rdx, gdx, bdx, a->r, a->g, a->b, mod_lut};
+#ifdef SOFT_RASTER_PROF_SPANS
             const uint32_t sp0 = esp_cpu_get_cycle_count();
             tex_span_dispatch(&t, &sp, gouraud, semi, tex_mode);
             psyz_prof_span_cy += esp_cpu_get_cycle_count() - sp0;
@@ -901,6 +1204,7 @@ SOFT_RASTER_IRAM static void raster_line(const SV* a, const SV* b, int semi) {
         steps = 1;
     }
     int abr = (cur_tpage >> 5) & 3;
+    tex_mark_dirty(x0 < x1 ? x0 : x1, y0 < y1 ? y0 : y1, x0 > x1 ? x0 : x1, y0 > y1 ? y0 : y1);
     for (int i = 0;; i++) {
         if (x0 >= st.x0 && x0 <= st.x1 && y0 >= st.y0 && y0 <= st.y1) {
             int r = a->r + (b->r - a->r) * i / steps;
@@ -945,8 +1249,13 @@ static void soft_clear_image(const PS1_RECT* rect, u8 r, u8 g, u8 b) {
     clut_cache_flush();
     u16 c = (u16)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
     int w = vram_clamp_w(rect, "clear"), h = vram_clamp_h(rect);
+    tex_mark_dirty(rect->x, rect->y, rect->x + w - 1, rect->y + h - 1);
     for (int y = 0; y < h; y++) {
-        u16* row = vram + ((rect->y + y) & (VRAM_H - 1)) * VRAM_W;
+        int yy = (rect->y + y) & (VRAM_H - 1);
+        if (yy < st.band_y0 || yy > st.band_y1) {
+            continue; /* the other worker's rows */
+        }
+        u16* row = vram + yy * VRAM_W;
         for (int x = 0; x < w; x++) {
             row[(rect->x + x) & (VRAM_W - 1)] = c;
         }
@@ -966,7 +1275,7 @@ static void soft_load_image(const PS1_RECT* rect, const u16* src) {
     }
     clut_cache_flush();
     int w = vram_clamp_w(rect, "load"), h = vram_clamp_h(rect);
-    (void)w;
+    tex_mark_dirty(rect->x, rect->y, rect->x + w - 1, rect->y + h - 1);
     for (int y = 0; y < h; y++) {
         u16* dst = vram + ((rect->y + y) & (VRAM_H - 1)) * VRAM_W + rect->x;
         memcpy(dst, src, (size_t)rect->w * 2);
@@ -999,6 +1308,7 @@ static void soft_move_image(const PS1_RECT* rect, int dx, int dy) {
     if (w <= 0 || h <= 0 || rect->x < 0 || rect->y < 0 || dx < 0 || dy < 0) {
         return;
     }
+    tex_mark_dirty(dx, dy, dx + w - 1, dy + h - 1);
     // memmove per row, walking in the safe direction for overlap
     if (dy <= rect->y) {
         for (int y = 0; y < h; y++) {
@@ -1208,13 +1518,25 @@ int Draw_PushPrim(u_long* packets, int max_len) {
 
 // ---- Draw_* state ----------------------------------------------------------
 
+static inline void soft_clip_update(void) {
+    st.y0 = st.area_y0 > st.band_y0 ? st.area_y0 : st.band_y0;
+    st.y1 = st.area_y1 < st.band_y1 ? st.area_y1 : st.band_y1;
+}
 void Draw_SetAreaStart(int x, int y) {
     st.x0 = x;
-    st.y0 = y;
+    st.area_y0 = y;
+    soft_clip_update();
 }
 void Draw_SetAreaEnd(int x, int y) {
     st.x1 = x;
-    st.y1 = y;
+    st.area_y1 = y;
+    soft_clip_update();
+}
+/* the rows this core's worker owns for the command stream it is executing */
+void Draw_SetBand(int y0, int y1) {
+    st.band_y0 = y0;
+    st.band_y1 = y1;
+    soft_clip_update();
 }
 void Draw_SetOffset(int x, int y) {
     x = x % VRAM_W;
