@@ -95,6 +95,10 @@ static unsigned exec_us_c[2];     /* wall time of each worker's last run */
 unsigned psyz_prof_exeq0_us;      /* core 0 worker time, for the telemetry */
 int psyz_raster_split_row;        /* telemetry copy */
 static int psyz_exec_queue(u_long* queue_buf, int queue_len, int y0, int y1);
+static void psyz_launch(u_long* buf, int len, int workers);
+static void rec_append(const u_long* w, int n);
+#include <stdio.h>
+#include <string.h>
 #else
 static int queue_len = 0;
 static u_long queue_buf[QUEUE_CAP];
@@ -134,19 +138,58 @@ int Psyz_GpuExeque() {
      * flag hands the tick off until the swap is published. */
     enqueue_in_progress = 1;
     psyz_wait_raster();
-    exec_buf = queue_buf;
-    exec_len = queue_len;
-    fill_idx ^= 1;
-    queue_buf = queue_bufs[fill_idx];
-    queue_len = 0;
-    if (psyz_fb_texture_seen) {
-        psyz_fb_texture_seen = 0;
-        fb_texture_frames = 4;
-    } else if (fb_texture_frames > 0) {
-        fb_texture_frames--;
+    {
+        u_long* buf = queue_buf;
+        const int len = queue_len;
+        int workers;
+        fill_idx ^= 1;
+        queue_buf = queue_bufs[fill_idx];
+        queue_len = 0;
+        workers = raster_task0 ? 2 : 1;
+        queue_has_move = 0;
+        rec_append(buf, len);
+        psyz_launch(buf, len, workers);
     }
-    exec_workers = (raster_task0 && !queue_has_move && fb_texture_frames == 0) ? 2 : 1;
-    queue_has_move = 0;
+    enqueue_in_progress = 0;
+    return 0;
+}
+
+/* Rendezvous of the two workers before a primitive that samples the frame
+ * buffer (see Psyz_GpuFeedbackCheck). Both execute the same stream, so both
+ * arrive once per such primitive. A worker alone in its batch returns at
+ * once. */
+static volatile int bar_count;
+static volatile unsigned bar_gen;
+void Psyz_GpuBarrier(void) {
+    if (exec_workers != 2) {
+        return;
+    }
+    const unsigned gen = bar_gen;
+    if (__atomic_add_fetch(&bar_count, 1, __ATOMIC_SEQ_CST) == 2) {
+        bar_count = 0;
+        __atomic_store_n(&bar_gen, gen + 1, __ATOMIC_RELEASE);
+    } else {
+        extern long long esp_timer_get_time(void);
+        const long long t0 = esp_timer_get_time();
+        while (__atomic_load_n(&bar_gen, __ATOMIC_ACQUIRE) == gen) {
+            if (esp_timer_get_time() - t0 > 500000) {
+                static int warned;
+                if (!warned) {
+                    warned = 1;
+                    printf("[gpu] feedback barrier: partner never arrived\n");
+                }
+                bar_count = 0;
+                break;
+            }
+        }
+    }
+}
+
+/* start the workers on a batch; the caller has waited for the previous one */
+static void psyz_launch(u_long* buf, int len, int workers) {
+    exec_buf = buf;
+    exec_len = len;
+    exec_workers = workers;
     if (exec_workers == 2) {
         /* rebalance on the previous dual batch's times, a few rows at a time */
         if (exec_us_c[1] > exec_us_c[0] + 1000u && raster_split_row > 48) {
@@ -168,8 +211,256 @@ int Psyz_GpuExeque() {
     if (exec_workers == 2) {
         xTaskNotifyGive(raster_task0);
     }
-    enqueue_in_progress = 0;
-    return 0;
+}
+
+/* --- frame recording and replay benchmark ------------------------------
+ * Every batch is copied into a record of the current frame (DG_SwapFrame
+ * marks the frame boundary). The pause menu writes the last complete frame
+ * next to its VRAM dump; at the next cart start that frame is replayed
+ * through the workers before the game runs, so the rasterizer's speed is
+ * measured on an identical scene from build to build. */
+#define REC_WORDS (QUEUE_CAP * 2)
+#define REC_BATCHES 8
+#define REC_FRAMES 6 /* a ring: the last complete frames, oldest first in the dump */
+typedef struct {
+    int nb, total;
+    int len[REC_BATCHES];
+} RecHdr;
+static u_long* rec_words[REC_FRAMES];
+static RecHdr rec_hdr[REC_FRAMES];
+static int rec_cur;
+static void rec_append(const u_long* w, int n) {
+    RecHdr* h = &rec_hdr[rec_cur];
+    if (!rec_words[0]) {
+        for (int i = 0; i < REC_FRAMES; i++) {
+            rec_words[i] = heap_caps_malloc(REC_WORDS * sizeof(u_long), MALLOC_CAP_SPIRAM);
+            if (!rec_words[i]) {
+                rec_words[0] = NULL;
+                return;
+            }
+        }
+    }
+    if (h->nb >= REC_BATCHES || h->total + n > REC_WORDS) {
+        return;
+    }
+    memcpy(rec_words[rec_cur] + h->total, w, (size_t)n * sizeof(u_long));
+    h->len[h->nb++] = n;
+    h->total += n;
+}
+void Psyz_GpuFrameMark(void) {
+    rec_cur = (rec_cur + 1) % REC_FRAMES;
+    rec_hdr[rec_cur].nb = 0;
+    rec_hdr[rec_cur].total = 0;
+}
+/* file: int count, then per frame RecHdr + words; the newest frame last */
+void Psyz_GpuDumpFrame(const char* path) {
+    FILE* f;
+    int count = 0;
+    if (!rec_words[0]) {
+        printf("[gpu] no recorded frame to dump\n");
+        return;
+    }
+    f = fopen(path, "wb");
+    if (!f) {
+        printf("[gpu] cannot write %s\n", path);
+        return;
+    }
+    for (int k = 1; k < REC_FRAMES; k++) {
+        if (rec_hdr[(rec_cur + k) % REC_FRAMES].nb > 0) {
+            count++;
+        }
+    }
+    fwrite(&count, sizeof count, 1, f);
+    for (int k = 1; k < REC_FRAMES; k++) {
+        const int i = (rec_cur + k) % REC_FRAMES;
+        if (rec_hdr[i].nb > 0) {
+            fwrite(&rec_hdr[i], sizeof(RecHdr), 1, f);
+            fwrite(rec_words[i], sizeof(u_long), (size_t)rec_hdr[i].total, f);
+        }
+    }
+    fclose(f);
+    printf("[gpu] frame dump: %s (%d frames, newest %d batches %d words)\n", path, count,
+           rec_hdr[(rec_cur + REC_FRAMES - 1) % REC_FRAMES].nb,
+           rec_hdr[(rec_cur + REC_FRAMES - 1) % REC_FRAMES].total);
+}
+static void psyz_replay_bench(void) {
+    extern unsigned short g_RawVram[];
+    extern long long esp_timer_get_time(void);
+    void Draw_FlushCaches(void);
+    RecHdr h;
+    u_long* w = NULL;
+    int count = 0;
+    FILE* f = fopen("/sdcard/mgs_gpu_frame.bin", "rb");
+    if (!f) {
+        return;
+    }
+    if (fread(&count, sizeof count, 1, f) != 1 || count <= 0 || count > REC_FRAMES) {
+        fclose(f);
+        return;
+    }
+    /* every recorded frame but the last: rendered once, exact single worker,
+     * on the dumped VRAM, and written to the card as a picture (the flicker
+     * alternates between frames, so one of these should hold a bad one) */
+    for (int k = 0; k < count; k++) {
+        if (fread(&h, sizeof h, 1, f) != 1 || h.nb <= 0 || h.nb > REC_BATCHES || h.total <= 0 ||
+            h.total > REC_WORDS) {
+            fclose(f);
+            free(w);
+            return;
+        }
+        free(w);
+        w = heap_caps_malloc((size_t)h.total * sizeof(u_long), MALLOC_CAP_SPIRAM);
+        if (!w || fread(w, sizeof(u_long), (size_t)h.total, f) != (size_t)h.total) {
+            fclose(f);
+            free(w);
+            return;
+        }
+        if (k == count - 1) {
+            break; /* the newest: the comparison and timing below */
+        }
+        {
+            extern int psyz_edge_dda, psyz_grad_float, psyz_mip_enable;
+            FILE* v = fopen("/sdcard/mgs_vram.bin", "rb");
+            char path[48];
+            if (v) {
+                fread(g_RawVram, 2, 1024u * 512u, v);
+                fclose(v);
+            }
+            Draw_FlushCaches();
+            psyz_grad_float = 0;
+            psyz_edge_dda = 0;
+            psyz_mip_enable = 0;
+            {
+                int off = 0;
+                for (int b = 0; b < h.nb; b++) {
+                    psyz_wait_raster();
+                    psyz_launch(w + off, h.len[b], 1);
+                    off += h.len[b];
+                }
+                psyz_wait_raster();
+            }
+            psyz_grad_float = 1;
+            psyz_edge_dda = 1;
+            snprintf(path, sizeof path, "/sdcard/mgs_cmp_f%d.bin", k);
+            v = fopen(path, "wb");
+            if (v) {
+                for (unsigned y = 0; y < 256; y++) {
+                    fwrite(&g_RawVram[y * 1024u], 2, 640, v);
+                }
+                fclose(v);
+            }
+            printf("[cmp] recorded frame %d of %d (%d words) rendered to %s\n", k, count, h.total, path);
+        }
+    }
+    fclose(f);
+    {
+        /* Correctness first: the frame under each optimisation against the
+         * exact-arithmetic single-worker rendering, as differing pixels in
+         * the two display buffers (640x256). VRAM is reloaded from the dump
+         * before every rendering. The display regions are written to the
+         * card for inspection. */
+        extern int psyz_edge_dda, psyz_grad_float, psyz_mip_enable;
+        static const char* const names[5] = {"reference", "float gradients", "dda edges",
+                                             "two workers", "two workers + mips"};
+        u16* ref = heap_caps_malloc(640u * 256u * 2u, MALLOC_CAP_SPIRAM);
+        for (int m = 0; m < 5 && ref; m++) {
+            f = fopen("/sdcard/mgs_vram.bin", "rb");
+            if (!f) {
+                break;
+            }
+            fread(g_RawVram, 2, 1024u * 512u, f);
+            fclose(f);
+            Draw_FlushCaches();
+            psyz_grad_float = (m == 1 || m >= 3);
+            psyz_edge_dda = (m == 2 || m >= 3);
+            psyz_mip_enable = (m == 4);
+            {
+                extern int psyz_grad_check;
+                psyz_grad_check = (m == 1) ? 12 : 0;
+            }
+            {
+                int off = 0;
+                for (int b = 0; b < h.nb; b++) {
+                    psyz_wait_raster();
+                    psyz_launch(w + off, h.len[b], (m >= 3 && raster_task0) ? 2 : 1);
+                    off += h.len[b];
+                }
+                psyz_wait_raster();
+            }
+            {
+                unsigned diff = 0, maxd = 0;
+                char path[48];
+                for (unsigned y = 0; y < 256; y++) {
+                    const u16* row = &g_RawVram[y * 1024u];
+                    u16* rrow = &ref[y * 640u];
+                    for (unsigned x = 0; x < 640; x++) {
+                        if (m == 0) {
+                            rrow[x] = row[x];
+                        } else if (rrow[x] != row[x]) {
+                            const unsigned a = rrow[x], b = row[x];
+                            unsigned d = 0, c;
+                            for (c = 0; c < 15; c += 5) {
+                                const unsigned ca = (a >> c) & 31, cb = (b >> c) & 31;
+                                const unsigned dc = ca > cb ? ca - cb : cb - ca;
+                                if (dc > d) d = dc;
+                            }
+                            if ((a ^ b) & 0x8000) d = 32;
+                            diff++;
+                            if (d > maxd) maxd = d;
+                        }
+                    }
+                }
+                printf("[cmp] %s: %u pixels differ from the reference (max channel diff %u)\n",
+                       names[m], diff, maxd);
+                snprintf(path, sizeof path, "/sdcard/mgs_cmp_%d.bin", m);
+                f = fopen(path, "wb");
+                if (f) {
+                    for (unsigned y = 0; y < 256; y++) {
+                        fwrite(&g_RawVram[y * 1024u], 2, 640, f);
+                    }
+                    fclose(f);
+                }
+            }
+        }
+        free(ref);
+        psyz_grad_float = 1;
+        psyz_edge_dda = 1;
+        psyz_mip_enable = 0;
+    }
+    f = fopen("/sdcard/mgs_vram.bin", "rb");
+    if (f) {
+        fread(g_RawVram, 2, 1024u * 512u, f);
+        fclose(f);
+    }
+    Draw_FlushCaches();
+    for (int mode = 0; mode < 3; mode++) {
+        extern int psyz_mip_enable;
+        const int iters = mode == 2 ? 10 : 30;
+        psyz_mip_enable = mode == 1; /* mode 1 measures the mips ON */
+        long long tsum = 0;
+        int counted = 0;
+        for (int it = 0; it < iters; it++) {
+            const long long t0 = esp_timer_get_time();
+            int off = 0;
+            for (int b = 0; b < h.nb; b++) {
+                psyz_wait_raster();
+                psyz_launch(w + off, h.len[b], (mode != 2 && raster_task0) ? 2 : 1);
+            if (mode == 1) { extern int psyz_mip_enable; psyz_mip_enable = 1; }
+                off += h.len[b];
+            }
+            psyz_wait_raster();
+            if (it >= iters / 2) {
+                tsum += esp_timer_get_time() - t0;
+                counted++;
+            }
+        }
+        printf("[bench] frame replay, %d batches %d words: %s %lld us/frame, split %d\n", h.nb,
+               h.total, mode == 0 ? "two workers" : mode == 1 ? "two workers, mips on" : "single worker",
+               tsum / counted, raster_split_row);
+        psyz_mip_enable = 0;
+    }
+    free(w);
+    Draw_FlushCaches();
 }
 
 /* DrawSync(0): everything queued so far has been drawn. */
@@ -238,6 +529,7 @@ void Psyz_GpuWorkerStart(void) {
     }
     printf("[gpu] raster workers on both cores (prio 4), split starts at row %d, %d-word queues x2\n",
            raster_split_row, QUEUE_CAP);
+    psyz_replay_bench();
 }
 
 /* --- save states (ESP): the worker and the CLUT cache belong to this run -- */
@@ -251,7 +543,14 @@ void Psyz_GpuSnapshotSetup(void) {
     Mgs_SnapshotPreserve(Draw_ClutCacheSlot(), 2 * sizeof(void*));
     {
         void** Draw_TiledSlot(void);
+        void** Draw_MipSlot(int* count);
+        void** Draw_MipGenSlot(void);
+        int n;
+        void** mips;
         Mgs_SnapshotPreserve(Draw_TiledSlot(), sizeof(void*));
+        mips = Draw_MipSlot(&n);
+        Mgs_SnapshotPreserve(mips, (size_t)n * sizeof(void*));
+        Mgs_SnapshotPreserve(Draw_MipGenSlot(), sizeof(void*));
     }
 }
 void Psyz_GpuAfterRestore(void) {
@@ -329,9 +628,19 @@ int Psyz_GpuExeque() {
             rect.h = (short)((queue_buf[i + 3] >> 16) & 0x3FF);
             x = queue_buf[i + 2] & 0x3FF;
             y = (queue_buf[i + 2] >> 16) & 0x1FF;
-            Draw_MoveImage(&rect, x, y);
 #ifdef ESP_PLATFORM
-            sotn_move_count++;
+            /* one worker moves, after both have drawn everything before it
+             * and before either draws anything after it */
+            Psyz_GpuBarrier();
+            if (exec_workers != 2 || core == 1) {
+                Draw_MoveImage(&rect, x, y);
+            }
+            Psyz_GpuBarrier();
+            if (core == 1) {
+                sotn_move_count++;
+            }
+#else
+            Draw_MoveImage(&rect, x, y);
 #endif
             i += 3; // consume the three parameter words or the parser
                     // re-reads them as opcodes and desyncs the stream
@@ -356,7 +665,15 @@ int Psyz_GpuExeque() {
             break;
         }
         case 0xC0: // read image
+#ifdef ESP_PLATFORM
+            Psyz_GpuBarrier();
+            if (exec_workers != 2 || core == 1) {
+                GPU_read_image();
+            }
+            Psyz_GpuBarrier();
+#else
             GPU_read_image();
+#endif
             break;
         case 0xE1:
             Draw_SetTexpageMode((ParamDrawTexpageMode*)&op);

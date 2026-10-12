@@ -166,11 +166,103 @@ void Draw_TiledInit(void) {
 }
 void** Draw_TiledSlot(void) { return (void**)&vram_tiled; } /* for save states */
 #else
-#define TEX_HW(tbase, page, hx, v) (page)[((v) << 10) + (hx)]
-#define tex_mark_dirty(x0, y0, x1, y1) ((void)0)
+#define TEX_HW(tbase, page, hx, v) (page)[((v) << vshift) + (hx)]
 void Draw_TiledInit(void) {}
 static void* tiled_none;
 void** Draw_TiledSlot(void) { return &tiled_none; }
+#ifdef SOFT_MIP_TEX
+/* Decimated copies of VRAM for minified textures. A triangle far from the
+ * camera steps several texels per pixel, so every pixel's texel sits on a
+ * fresh cache line (~125 cycles on this board) and the fetch dominates the
+ * span. Level k holds every 2^k-th texel in both directions, in the same
+ * packed format as VRAM but at 1/2^k the width and height, so a minified
+ * triangle sampled at level k walks the shadow at about one texel per pixel.
+ * The format depends on how a page is read (4/8/15 bpp), which VRAM does
+ * not record: there is a shadow per (bpp, level), each built lazily.
+ * Staleness: every VRAM write bumps a generation per 64x32 region; a page
+ * sampled at level k rebuilds the regions whose generation moved since the
+ * shadow was built. The frame buffer and the radar are sampled at level 0,
+ * which always reads VRAM itself. */
+#include <stdlib.h>
+#include <string.h>
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#endif
+#define MIP_LEVELS 3
+int psyz_mip_enable = 0; /* measured no gain on the dock replay frame; kept for experiments */
+static u16* mip_shadow[3][MIP_LEVELS];       /* [bpp][level-1] */
+static uint32_t* region_gen;                 /* [256], internal RAM */
+static uint32_t mip_built[3][MIP_LEVELS][256]; /* generation each region was built at */
+static inline void tex_mark_dirty(int x0, int y0, int x1, int y1) {
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > VRAM_W - 1) x1 = VRAM_W - 1;
+    if (y1 > VRAM_H - 1) y1 = VRAM_H - 1;
+    if (x0 > x1 || y0 > y1 || !region_gen) {
+        return;
+    }
+    for (int r = y0 >> 5; r <= (y1 >> 5); r++) {
+        for (int c = x0 >> 6; c <= (x1 >> 6); c++) {
+            __atomic_fetch_add(&region_gen[r * 16 + c], 1u, __ATOMIC_RELAXED);
+        }
+    }
+}
+static void mip_build_region(int bpp, int k, int col, int row) {
+#ifdef ESP_PLATFORM
+    const uint32_t t0 = esp_cpu_get_cycle_count();
+#endif
+    u16* const out = mip_shadow[bpp][k - 1];
+    const int ow = VRAM_W >> k;
+    for (int yo = (row * 32) >> k; yo < ((row + 1) * 32) >> k; yo++) {
+        const u16* src = vram + (yo << k) * VRAM_W;
+        u16* dst = out + yo * ow;
+        const int hx0 = (col * 64) >> k, hx1 = ((col + 1) * 64) >> k;
+        if (bpp == 2) {
+            for (int hx = hx0; hx < hx1; hx++) {
+                dst[hx] = src[hx << k];
+            }
+        } else if (bpp == 1) {
+            for (int hx = hx0; hx < hx1; hx++) {
+                const int t0x = hx << (k + 1), t1x = t0x + (1 << k);
+                const unsigned b0 = (src[t0x >> 1] >> ((t0x & 1) * 8)) & 0xFF;
+                const unsigned b1 = (src[t1x >> 1] >> ((t1x & 1) * 8)) & 0xFF;
+                dst[hx] = (u16)(b0 | (b1 << 8));
+            }
+        } else {
+            for (int hx = hx0; hx < hx1; hx++) {
+                unsigned o = 0;
+                for (int i = 0; i < 4; i++) {
+                    const int tx = (hx << (k + 2)) + (i << k);
+                    o |= ((src[tx >> 2] >> ((tx & 3) * 4)) & 0xF) << (i * 4);
+                }
+                dst[hx] = (u16)o;
+            }
+        }
+    }
+#ifdef ESP_PLATFORM
+    PROFC.retile_cy += esp_cpu_get_cycle_count() - t0;
+    PROFC.retile_n++;
+#endif
+}
+void Draw_MipInit(void) {
+    if (!region_gen) {
+        region_gen = heap_caps_calloc(256, sizeof(uint32_t), MALLOC_CAP_INTERNAL);
+    }
+    memset(mip_built, 0xFF, sizeof mip_built);
+}
+/* save states: the shadow pointers and the generation table are this run's */
+void** Draw_MipSlot(int* count) { *count = 3 * MIP_LEVELS; return (void**)mip_shadow; }
+void** Draw_MipGenSlot(void) { return (void**)&region_gen; }
+static inline void mip_flush(void) { memset(mip_built, 0xFF, sizeof mip_built); }
+#else
+#define tex_mark_dirty(x0, y0, x1, y1) ((void)0)
+void Draw_MipInit(void) {}
+static void* mip_none[9];
+static void* mip_gen_none;
+void** Draw_MipSlot(int* count) { *count = 9; return mip_none; }
+void** Draw_MipGenSlot(void) { return &mip_gen_none; }
+#define mip_flush() ((void)0)
+#endif
 #endif
 
 typedef struct {
@@ -246,8 +338,12 @@ static u16 clut_cache_key_c[2][8] = {{0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x
 static u8 clut_cache_next_c[2];
 #define clut_cache_next clut_cache_next_c[soft_core()]
 static void clut_cache_flush(void) {
-    for (int i = 0; i < 8; i++) {
-        clut_cache_key[i] = 0xFFFF;
+    /* both cores': a VRAM block operation executed on one worker (MoveImage
+     * between barriers) invalidates the other's cached palettes too */
+    for (int c = 0; c < 2; c++) {
+        for (int i = 0; i < 8; i++) {
+            clut_cache_key_c[c][i] = 0xFFFF;
+        }
     }
 }
 #ifdef ESP_PLATFORM
@@ -256,6 +352,8 @@ void** Draw_ClutCacheSlot(void) { return (void**)clut_cache_c; } /* both cores' 
 void Draw_FlushCaches(void) {
 #ifdef SOFT_TILED_TEX
     tex_dirty_all();
+#else
+    mip_flush();
 #endif
     for (int c = 0; c < 2; c++) {
         for (int i = 0; i < 8; i++) {
@@ -337,6 +435,9 @@ typedef struct {
     int bpp;          // 0=4bpp, 1=8bpp, 2=15bpp
     int abr;          // semi-transparency mode from the tpage
     int tbase;        // tiled shadow: halfword index of the page's first tile
+    int px, py;       // page origin in VRAM, halfwords
+    int vshift;       // log2 of the page's row stride in halfwords (10, or less in a mip level)
+    int umask, vmask; // texel coordinate wrap (0xFF, or less in a mip level)
 } Tex;
 
 static inline Tex tex_from(u16 tpage, u16 clut) {
@@ -349,6 +450,10 @@ static inline Tex tex_from(u16 tpage, u16 clut) {
         psyz_fb_texture_seen = 1;
     }
     t.tbase = ((py >> 3) << 13) + ((px >> 3) << 6);
+    t.px = px;
+    t.py = py;
+    t.vshift = 10;
+    t.umask = t.vmask = 0xFF;
 #ifdef SOFT_TILED_TEX
     /* the page covers 1, 2 or 4 columns of 64 halfwords */
     tex_sync_page(px, py, 1 << (t.bpp > 2 ? 2 : t.bpp));
@@ -363,9 +468,41 @@ static inline Tex tex_from(u16 tpage, u16 clut) {
     return t;
 }
 
+#ifdef SOFT_MIP_TEX
+/* point t at level k of its page, rebuilding stale regions first */
+static void tex_mip(Tex* t, int k) {
+    const int bpp = t->bpp > 2 ? 2 : t->bpp;
+    if (!mip_shadow[bpp][k - 1]) {
+        mip_shadow[bpp][k - 1] = heap_caps_malloc(((size_t)VRAM_W >> k) * (VRAM_H >> k) * sizeof(u16),
+                                                  MALLOC_CAP_SPIRAM);
+        if (!mip_shadow[bpp][k - 1]) {
+            return; /* stay at level 0 */
+        }
+        memset(mip_built[bpp][k - 1], 0xFF, sizeof mip_built[bpp][k - 1]);
+    }
+    const int ncols = 1 << bpp, col0 = t->px >> 6, row0 = t->py >> 5;
+    for (int r = row0; r < row0 + 8; r++) {
+        for (int c = 0; c < ncols; c++) {
+            const int reg = r * 16 + ((col0 + c) & 15);
+            const uint32_t gen = region_gen[reg];
+            if (mip_built[bpp][k - 1][reg] != gen) {
+                mip_built[bpp][k - 1][reg] = gen; /* before the copy: a write during it re-marks */
+                mip_build_region(bpp, k, (col0 + c) & 15, r);
+            }
+        }
+    }
+    t->page = mip_shadow[bpp][k - 1] + (t->py >> k) * (VRAM_W >> k) + (t->px >> k);
+    t->vshift = 10 - k;
+    t->umask = 0xFF >> k;
+    t->vmask = 0xFF >> k;
+}
+#endif
+
 static inline u16 tex_fetch(const Tex* t, int u, int v) {
-    u &= 0xFF;
-    v &= 0xFF;
+    const int vshift = t->vshift;
+    (void)vshift;
+    u &= t->umask;
+    v &= t->vmask;
     switch (t->bpp) {
     case 0: { // 4bpp: 4 texels per halfword
         u16 hw = TEX_HW(t->tbase, t->page, u >> 2, v);
@@ -471,6 +608,8 @@ static inline void put_flat(u16* dst, int r8, int g8, int b8, int semi,
 SOFT_RASTER_IRAM static void raster_sprite(const SV* v, int w, int h, u16 tpage, u16 clut,
                           int semi) {
     Tex t = tex_from(tpage, clut);
+    const int vshift = t.vshift;
+    (void)vshift;
     int x0 = v->x + st.ox, y0 = v->y + st.oy;
     // clip once instead of testing every pixel
     int i0 = 0, i1 = w - 1, j0 = 0, j1 = h - 1;
@@ -615,8 +754,10 @@ static inline __attribute__((always_inline)) void tex_span_body(
     u16* __restrict dst = sp->dst;
     const u16* __restrict page = t->page;
     const int tbase = t->tbase;
+    const int vshift = t->vshift, umask = t->umask, vmask = t->vmask;
     (void)page;
     (void)tbase;
+    (void)vshift;
     const u16* __restrict clut = t->clut;
     const int abr = t->abr;
     int32_t ui = sp->ui, vi = sp->vi;
@@ -627,8 +768,8 @@ static inline __attribute__((always_inline)) void tex_span_body(
     const int mchk = st.mask_check;
     const u16 mor = st.mask_or;
     for (int n = sp->n; n > 0; n--, dst++, ui += udx, vi += vdx) {
-        const int u = (ui >> 16) & 0xFF;
-        const int v = (vi >> 16) & 0xFF;
+        const int u = (ui >> 16) & umask;
+        const int v = (vi >> 16) & vmask;
         u16 texel;
         if (bpp == 0) {
             const u16 hw = TEX_HW(tbase, page, u >> 2, v);
@@ -744,11 +885,51 @@ SOFT_RASTER_IRAM static void tex_span_dispatch(const Tex* t, const TexSpan* sp,
  * division, advanced exactly. Output is bit-identical to the divide form. */
 typedef struct {
     int q, r, dq, dr, A, kind; /* kind 0: left bound, 1: right bound, 2: horizontal edge */
+    int Ao, B, w0, k;          /* for the divide-per-row reference path */
 } EdgeDDA;
+int psyz_edge_dda = 1;   /* 0: the divide-per-row form (reference) */
+int psyz_grad_float = 1; /* 0: exact reciprocal gradients (reference) */
+/* (num << 16 +- area/2) / area, rounded half away from zero, exactly as the
+ * integer form -- but from a float estimate: the FPU gives a quotient within
+ * one of the truth, and one 64-bit multiply-and-compare corrects it. The
+ * game's texture mappings land texel coordinates exactly on integers at
+ * pixel centres, so a quotient one unit short picks the neighbouring texel
+ * row for a whole triangle (the opening's dark water wedges). Numerators
+ * the float path cannot hold take the division itself. */
+static inline long long div_area_16_fast(long long num, int area, float inv_area_f) {
+    const int neg = num < 0;
+    const unsigned long long mag = (unsigned long long)(neg ? -num : num);
+    const unsigned long long m = (mag << 16) + (unsigned long long)area / 2;
+    unsigned long long q;
+    if (mag < (1ull << 31)) {
+        const float gf = (float)(uint32_t)mag * inv_area_f;
+        if (gf < 2147483648.0f) {
+            long long r;
+            q = (unsigned long long)(uint32_t)__builtin_lrintf(gf);
+            r = (long long)(m - q * (unsigned long long)area);
+            while (r < 0) {
+                q--;
+                r += area;
+            }
+            while (r >= area) {
+                q++;
+                r -= area;
+            }
+            return neg ? -(long long)q : (long long)q;
+        }
+    }
+    q = m / (unsigned long long)area;
+    return neg ? -(long long)q : (long long)q;
+}
+int psyz_grad_check;     /* >0: compare float and exact per triangle, print this many */
 static inline int floordiv_i(int n, int d) {
     return n >= 0 ? n / d : -((-n + d - 1) / d);
 }
 static inline void edge_dda_init(EdgeDDA* e, int A, int B, int w) {
+    e->Ao = A;
+    e->B = B;
+    e->w0 = w;
+    e->k = 0;
     if (A == 0) {
         e->kind = 2; /* inside iff w >= 0; w moves by B per row */
         e->q = w;
@@ -777,6 +958,29 @@ static inline void edge_dda_init(EdgeDDA* e, int A, int B, int w) {
 /* the row's span, then advance all three edges to the next row; 0 if empty */
 static inline int edge_row(EdgeDDA* ed, int minx, int maxx, int* pxl, int* pxr) {
     int xl = minx, xr = maxx, ok = 1;
+    if (!psyz_edge_dda) {
+        /* reference: the edge value at this row, one divide per edge */
+        for (int i = 0; i < 3; i++) {
+            EdgeDDA* e = &ed[i];
+            const int w = e->w0 + e->k * e->B, A = e->Ao;
+            e->k++;
+            if (A == 0) {
+                if (w < 0) ok = 0;
+            } else if (A > 0) {
+                if (w < 0) {
+                    const int x = minx + (-w + A - 1) / A;
+                    if (x > xl) xl = x;
+                }
+            } else {
+                if (w < 0) ok = 0;
+                const int x = minx + w / (-A);
+                if (x < xr) xr = x;
+            }
+        }
+        *pxl = xl;
+        *pxr = xr;
+        return ok && xl <= xr;
+    }
     for (int i = 0; i < 3; i++) {
         EdgeDDA* e = &ed[i];
         if (e->kind == 2) {
@@ -855,6 +1059,10 @@ void Draw_Benchmark(void) {
         pages[i].bpp = 0;
         pages[i].abr = 0;
         pages[i].tbase = ((i & 15) * 64 >> 3) << 6;
+        pages[i].px = (i & 15) * 64;
+        pages[i].py = 0;
+        pages[i].vshift = 10;
+        pages[i].umask = pages[i].vmask = 0xFF;
     }
     u16* dst = vram + 256 * VRAM_W;
     const int32_t one = 1 << 16;
@@ -1013,7 +1221,10 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     // over (x,y): compute d/dx and d/dy once with a handful of divisions, then
     // step. The +area/2 rounds the gradient to nearest, which keeps the last
     // scanline of a 255-wide gradient from drifting versus the exact form.
-#ifdef SOFT_RASTER_RECIP
+#if defined(SOFT_RASTER_FLOAT_GRAD) && !defined(SOFT_RASTER_RECIP)
+#error "SOFT_RASTER_FLOAT_GRAD needs SOFT_RASTER_RECIP: the exact path stays as the reference"
+#endif
+#if defined(SOFT_RASTER_RECIP)
     // RV32 has no 64-bit divide: each of the fifteen (s64)/area below is a
     // library call of a few hundred cycles, which per triangle outweighed the
     // texels. One 64-bit divide gives 2^32/area; every quotient is then a
@@ -1023,7 +1234,11 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     // (a numerator beyond 2^31, or area 1) take the division itself.
     typedef long long s64;
     typedef unsigned long long u64;
+#if defined(SOFT_RASTER_FLOAT_GRAD)
+    const u64 inv_area = (psyz_grad_float && !psyz_grad_check) ? 0 : ((u64)1 << 32) / (u64)area;
+#else
     const u64 inv_area = ((u64)1 << 32) / (u64)area;
+#endif
     s64 dx_, dy_;
     s64 div_area_16(s64 num) /* (num << 16 +- area/2) / area, like the exact form */
     {
@@ -1042,9 +1257,26 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
         return neg ? -(s64)q : (s64)q;
     }
 #define DIV_AREA_16(num) div_area_16((s64)(num))
+#if defined(SOFT_RASTER_FLOAT_GRAD)
+    // Single-precision FPU: gradient = numerator * (65536 / area), rounded
+    // to nearest. The numerators are under 2^21 and the float mantissa has
+    // 24 bits, so the result is within one 16.16 unit of the exact form --
+    // for ~1200 cycles less per triangle than the reciprocal fix-ups.
+    // Runtime-selectable so the replay benchmark can compare the two.
+    const float inv_area_f = 65536.0f / (float)area;
+#define GRAD(p0, p1, p2)                                                       \
+    if (psyz_grad_float) {                                                     \
+        dx_ = div_area_16_fast((A0) * (p0) + (A1) * (p1) + (A2) * (p2), area, inv_area_f); \
+        dy_ = div_area_16_fast((B0) * (p0) + (B1) * (p1) + (B2) * (p2), area, inv_area_f); \
+    } else {                                                                   \
+        dx_ = DIV_AREA_16((s64)(A0) * (p0) + (s64)(A1) * (p1) + (s64)(A2) * (p2)); \
+        dy_ = DIV_AREA_16((s64)(B0) * (p0) + (s64)(B1) * (p1) + (s64)(B2) * (p2)); \
+    }
+#else
 #define GRAD(p0, p1, p2)                                                       \
     dx_ = DIV_AREA_16((s64)(A0) * (p0) + (s64)(A1) * (p1) + (s64)(A2) * (p2)); \
     dy_ = DIV_AREA_16((s64)(B0) * (p0) + (s64)(B1) * (p1) + (s64)(B2) * (p2));
+#endif
 #else
 #define GRAD(p0, p1, p2)                                                           dx_ = ((s64)(A0) * (p0) + (s64)(A1) * (p1) + (s64)(A2) * (p2)) * 65536;        dy_ = ((s64)(B0) * (p0) + (s64)(B1) * (p1) + (s64)(B2) * (p2)) * 65536;        dx_ = dx_ >= 0 ? (dx_ + area / 2) / area : (dx_ - area / 2) / area;            dy_ = dy_ >= 0 ? (dy_ + area / 2) / area : (dy_ - area / 2) / area;
 
@@ -1062,7 +1294,17 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     fx rrow = 0, grow = 0, brow = 0, urow = 0, vrow = 0;
     fx rdx = 0, rdy = 0, gdx = 0, gdy = 0, bdx = 0, bdy = 0;
     fx udx = 0, udy = 0, vdx = 0, vdy = 0;
-#ifdef SOFT_RASTER_RECIP
+#if defined(SOFT_RASTER_FLOAT_GRAD)
+/* the three terms are large and cancel (the edge values at the bounding-box
+ * corner can be ~2^22 while their weighted sum is small): summed exactly in
+ * 64 bits, then one float multiply. In float they lost up to 64 units each,
+ * which on long thin triangles (the opening's water) showed as texture
+ * wobble. */
+#define ROW0(p0, p1, p2)                                                       \
+    (psyz_grad_float                                                           \
+         ? (fx)div_area_16_fast((s64)e0r * (p0) + (s64)e1r * (p1) + (s64)e2r * (p2), area, inv_area_f) \
+         : (fx)DIV_AREA_16((s64)e0r * (p0) + (s64)e1r * (p1) + (s64)e2r * (p2)))
+#elif defined(SOFT_RASTER_RECIP)
 #define ROW0(p0, p1, p2) ((fx)DIV_AREA_16((s64)e0r * (p0) + (s64)e1r * (p1) + (s64)e2r * (p2)))
 #else
 #define ROW0(p0, p1, p2) ((fx)(((s64)(e0r * (p0) + e1r * (p1) + e2r * (p2)) << 16) / area))
@@ -1080,10 +1322,65 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
         GRAD(a->v, b->v, c->v) vdx = (fx)dx_; vdy = (fx)dy_;
         urow = ROW0(a->u, b->u, c->u);
         vrow = ROW0(a->v, b->v, c->v);
+#ifdef SOFT_MIP_TEX
+        {
+            /* texels per pixel along x and y, from the larger axis step */
+            fx s = udx < 0 ? -udx : udx;
+            fx s2 = vdx < 0 ? -vdx : vdx;
+            if (s2 > s) s = s2;
+            s2 = udy < 0 ? -udy : udy;
+            if (s2 > s) s = s2;
+            s2 = vdy < 0 ? -vdy : vdy;
+            if (s2 > s) s = s2;
+            const int level = s >= (8 << 16) ? 3 : s >= (4 << 16) ? 2 : s >= (2 << 16) ? 1 : 0;
+#ifdef ESP_PLATFORM
+            PROFC.mip_tris[level]++;
+#endif
+            if (level && t.bpp <= 1 && psyz_mip_enable) {
+                /* palette textures only: a 15-bit page is a frame-buffer
+                 * effect or a movie frame, sampled live */
+                tex_mip(&t, level);
+                if (t.vshift != 10) { /* the level is available */
+                    udx >>= level; udy >>= level; vdx >>= level; vdy >>= level;
+                    urow >>= level; vrow >>= level;
+                }
+            }
+        }
+#endif
     }
+#if defined(SOFT_RASTER_FLOAT_GRAD) && defined(SOFT_RASTER_RECIP)
+    if (psyz_grad_check > 0 && psyz_grad_float) {
+        /* the exact values for the same triangle, printed when they differ
+         * from what the float path produced by more than 1/16 of a level */
+#define CHK(name, p0, p1, p2, fdx, fdy, frow)                                      \
+        {                                                                          \
+            const s64 ex = DIV_AREA_16((s64)(A0) * (p0) + (s64)(A1) * (p1) + (s64)(A2) * (p2)); \
+            const s64 ey = DIV_AREA_16((s64)(B0) * (p0) + (s64)(B1) * (p1) + (s64)(B2) * (p2)); \
+            const s64 er = DIV_AREA_16((s64)e0r * (p0) + (s64)e1r * (p1) + (s64)e2r * (p2)); \
+            const s64 dd = (ex - (fdx)) * (maxx - minx) + (ey - (fdy)) * (maxy - miny) + (er - (frow)); \
+            if ((dd > 4096 || dd < -4096) && psyz_grad_check > 0) {                \
+                psyz_grad_check--;                                                 \
+                printf("[gradchk] %c tri (%d,%d) (%d,%d) (%d,%d) area %d bbox %d,%d..%d,%d p %d %d %d " \
+                       "exact dx %lld dy %lld r0 %lld | float dx %d dy %d r0 %d\n",      \
+                       name, ax, ay, bx, by, cx, cy, area, minx, miny, maxx, maxy, (int)(p0), \
+                       (int)(p1), (int)(p2), ex, ey, er, (int)(fdx), (int)(fdy), (int)(frow)); \
+            }                                                                      \
+        }
+        if (gouraud) {
+            CHK('r', a->r, b->r, c->r, rdx, rdy, rrow)
+            CHK('g', a->g, b->g, c->g, gdx, gdy, grow)
+            CHK('b', a->b, b->b, c->b, bdx, bdy, brow)
+        }
+        if (textured) {
+            CHK('u', a->u, b->u, c->u, udx, udy, urow)
+            CHK('v', a->v, b->v, c->v, vdx, vdy, vrow)
+        }
+#undef CHK
+    }
+#endif
 #undef GRAD
 #undef ROW0
-#ifdef SOFT_RASTER_RECIP
+#if defined(SOFT_RASTER_RECIP)
 #undef DIV_AREA_16
 #endif
 #ifdef ESP_PLATFORM
@@ -1170,6 +1467,10 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
             psyz_prof_px += (unsigned)sp.n;
 #else
             tex_span_dispatch(&t, &sp, gouraud, semi, tex_mode);
+#ifdef ESP_PLATFORM
+            psyz_prof_rows++;
+            psyz_prof_px += (unsigned)sp.n;
+#endif
 #endif
             continue;
         }
@@ -1334,6 +1635,18 @@ static SoftPos display_area_px = {0, 0};
 static SoftPos display_size_px = {256, 240};
 static int display_enabled = 1;
 
+#ifdef ESP_PLATFORM
+/* A primitive that samples the frame buffer must see every earlier
+ * primitive drawn by BOTH workers: the two rendezvous before it. Decided
+ * from the packet's texpage, identically on both workers, before any
+ * per-band clipping can make them diverge. */
+void Psyz_GpuBarrier(void);
+static inline void Psyz_GpuFeedbackCheck(u16 tpage) {
+    if (((tpage >> 7) & 3) >= 2 && ((tpage >> 4) & 1) == 0 && (tpage & 0xF) < 10) {
+        Psyz_GpuBarrier();
+    }
+}
+#endif
 int Draw_PushPrim(u_long* packets, int max_len) {
     int len = max_len;
     int code = (int)(*packets >> 24) & 0xFF;
@@ -1408,6 +1721,9 @@ int Draw_PushPrim(u_long* packets, int max_len) {
         {
 #ifdef ESP_PLATFORM
             PROF_BEGIN();
+            if (isTextured) {
+                Psyz_GpuFeedbackCheck(tpage);
+            }
 #endif
             raster_tri(&v[0], &v[1], &v[2], isTextured, tpage, clut, isSemi,
                        isGouraud);
@@ -1504,6 +1820,9 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             PROF_BEGIN();
 #endif
             if (isTextured) {
+#ifdef ESP_PLATFORM
+                Psyz_GpuFeedbackCheck(tpage);
+#endif
                 raster_sprite(&v[0], w, h, tpage, clut, isSemi);
             } else {
                 raster_tile(&v[0], w, h, isSemi, (cur_tpage >> 5) & 3);

@@ -8,7 +8,8 @@ typedef struct {
     unsigned cy[6], n[6];
     unsigned tri_off, tri_tiny, tri_ok, tri_huge;
     unsigned prim_by_code[8];
-    unsigned retile_n, retile_cy; /* tiled texture shadow regions re-copied */
+    unsigned retile_n, retile_cy; /* texture shadow regions (re)built */
+    unsigned mip_tris[4];         /* textured triangles by mip level */
     /* textured spans by (clamp << 5 | bpp << 3 | gouraud << 2 | semi << 1 | modulate),
      * filled only when the rasterizer is built with SOFT_RASTER_PROF_SPANS */
     unsigned case_cy[64], case_px[64], case_rows[64];
