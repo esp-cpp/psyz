@@ -63,7 +63,11 @@ void Draw_SetTextureWindow(unsigned int mask_x, unsigned int mask_y,
 static u16 soft_vram_fallback[VRAM_H * VRAM_W];
 #define SOFT_VRAM soft_vram_fallback
 #else
+#ifdef ESP_PLATFORM
+extern u16* g_RawVram; /* port/esp32_arena.c */
+#else
 extern u16 g_RawVram[VRAM_H * VRAM_W] __attribute__((weak));
+#endif
 static u16 soft_vram_fallback[VRAM_H * VRAM_W];
 #define SOFT_VRAM (g_RawVram ? g_RawVram : soft_vram_fallback)
 #endif
@@ -349,6 +353,31 @@ static void clut_cache_flush(void) {
 #ifdef ESP_PLATFORM
 /* for save states: the cache memory is this run's, its contents stale */
 void** Draw_ClutCacheSlot(void) { return (void**)clut_cache_c; } /* both cores' */
+/* at cart shutdown: every heap allocation of the rasterizer (the statics
+ * holding the pointers are reset before the next launch) */
+void Draw_FreeCaches(void) {
+    for (int c = 0; c < 2; c++) {
+        free(clut_cache_c[c]);
+        clut_cache_c[c] = NULL;
+        for (int i = 0; i < 8; i++) {
+            clut_cache_key_c[c][i] = 0xFFFF;
+        }
+    }
+#ifdef SOFT_TILED_TEX
+    free(vram_tiled);
+    vram_tiled = NULL;
+#endif
+#ifdef SOFT_MIP_TEX
+    free(region_gen);
+    region_gen = NULL;
+    for (int b = 0; b < 3; b++) {
+        for (int k = 0; k < MIP_LEVELS; k++) {
+            free(mip_shadow[b][k]);
+            mip_shadow[b][k] = NULL;
+        }
+    }
+#endif
+}
 void Draw_FlushCaches(void) {
 #ifdef SOFT_TILED_TEX
     tex_dirty_all();
@@ -1112,7 +1141,7 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     {
         /* one-shot: where is the rasterizer actually writing, and what is it
          * clipping to? Compare against the framebuffer the scanout reads. */
-        extern unsigned short g_RawVram[];
+        extern unsigned short *g_RawVram;
         static int shown = 3;
         if (shown > 0) {
             shown--;

@@ -71,8 +71,21 @@ int psyz_queue_canary_hi;
 #include "freertos/idf_additions.h"
 #include "esp_heap_caps.h"
 #include "esp_cpu.h"
-PSYZ_ESP_XRAM static u_long queue_bufs[2][QUEUE_CAP];
-static u_long* queue_buf = queue_bufs[0];
+#ifdef ESP_PLATFORM
+/* in the cart's arena (port/esp32_arena.c), bound at launch */
+static u_long (*queue_bufs)[QUEUE_CAP];
+static u_long* queue_buf;
+size_t Psyz_GpuQueueBytes(void) { return 2 * QUEUE_CAP * sizeof(u_long); }
+void Psyz_GpuBindQueues(void* p) {
+    queue_bufs = (u_long(*)[QUEUE_CAP])p;
+    queue_buf = p ? queue_bufs[0] : NULL;
+    queue_len = 0;
+}
+#else
+static u_long queue_bufs_storage[2][QUEUE_CAP];
+static u_long (*queue_bufs)[QUEUE_CAP] = queue_bufs_storage;
+static u_long* queue_buf = queue_bufs_storage[0];
+#endif
 static int fill_idx;
 static u_long* exec_buf;
 static int exec_len;
@@ -230,6 +243,11 @@ static u_long* rec_words[REC_FRAMES];
 static RecHdr rec_hdr[REC_FRAMES];
 static int rec_cur;
 static void rec_append(const u_long* w, int n) {
+#ifndef MGS_REPLAY_BENCH
+    (void)w;
+    (void)n;
+    return; /* development build only (CONFIG_MGS_REPLAY_BENCH) */
+#endif
     RecHdr* h = &rec_hdr[rec_cur];
     if (!rec_words[0]) {
         for (int i = 0; i < REC_FRAMES; i++) {
@@ -257,7 +275,7 @@ void Psyz_GpuDumpFrame(const char* path) {
     FILE* f;
     int count = 0;
     if (!rec_words[0]) {
-        printf("[gpu] no recorded frame to dump\n");
+        printf("[gpu] no recorded frame to dump (CONFIG_MGS_REPLAY_BENCH)\n");
         return;
     }
     f = fopen(path, "wb");
@@ -284,7 +302,10 @@ void Psyz_GpuDumpFrame(const char* path) {
            rec_hdr[(rec_cur + REC_FRAMES - 1) % REC_FRAMES].total);
 }
 static void psyz_replay_bench(void) {
-    extern unsigned short g_RawVram[];
+#ifndef MGS_REPLAY_BENCH
+    return;
+#endif
+    extern unsigned short *g_RawVram;
     extern long long esp_timer_get_time(void);
     void Draw_FlushCaches(void);
     RecHdr h;
@@ -506,12 +527,14 @@ void Psyz_GpuWorkerStart(void) {
         raster_done = xSemaphoreCreateBinary();
     }
     raster_busy = 0;
+#ifdef MGS_REPLAY_BENCH
     {
         /* the span-loop micro-benchmark, once, before the game loads any
          * texture (a constructor is too early for the console) */
         void Draw_Benchmark(void);
         Draw_Benchmark();
     }
+#endif
     if (xTaskCreatePinnedToCoreWithCaps(psyz_raster_task, "psyz_raster", 8192,
                                         (void*)1, 4, &raster_task, 1,
                                         MALLOC_CAP_SPIRAM) != pdPASS) {
@@ -576,6 +599,20 @@ void Psyz_GpuWorkerStop(void) {
     vSemaphoreDelete(raster_done);
     raster_done = NULL;
     raster_busy = 0;
+    /* the cart's statics are reset for the next launch, so everything this
+     * run took from the heap goes back now: the frame recorder's buffers
+     * and the rasterizer's caches and shadows */
+    for (int i = 0; i < REC_FRAMES; i++) {
+        free(rec_words[i]);
+        rec_words[i] = NULL;
+        rec_hdr[i].nb = 0;
+        rec_hdr[i].total = 0;
+    }
+    rec_cur = 0;
+    {
+        void Draw_FreeCaches(void);
+        Draw_FreeCaches();
+    }
 }
 
 volatile int psyz_trace_env; /* frames of E5/E6 tracing left (set by the game) */

@@ -114,7 +114,7 @@ typedef struct {
 } VoiceState;
 
 // Full SPU state
-PSYZ_ESP_XRAM static struct {
+typedef struct {
     u8 ram[PSYZ_SPU_RAM_SIZE];
 
     // Transfer address (byte address into SPU RAM)
@@ -131,7 +131,17 @@ PSYZ_ESP_XRAM static struct {
     unsigned cd_ring_count; // number of valid frames in ring
 
     u8 initialized;
-} spu;
+} SpuState;
+#ifdef ESP_PLATFORM
+/* in the cart's arena (port/esp32_arena.c), bound at launch */
+static SpuState* spu_p;
+void Psyz_SpuBind(void* p) { spu_p = (SpuState*)p; }
+size_t Psyz_SpuStateSize(void) { return sizeof(SpuState); }
+#else
+static SpuState spu_storage;
+static SpuState* spu_p = &spu_storage;
+#endif
+#define spu (*spu_p)
 
 u8* Psyz_SpuGetRam(void) { return spu.ram; }
 
@@ -152,13 +162,12 @@ static void spu_reset(void) {
 }
 
 static void spu_reset_hot(void) {
-    /* 512KB on the stack is instantly fatal on an embedded task (ESP32-S3
-       stacks are tens of KB), and needlessly deep on desktop threads too.
-       Static: this path is not reentrant - it swaps SPU RAM around a reset. */
-    PSYZ_ESP_XRAM static u8 saved_ram[PSYZ_SPU_RAM_SIZE];
-    memcpy(saved_ram, spu.ram, PSYZ_SPU_RAM_SIZE);
-    spu_reset();
-    memcpy(spu.ram, saved_ram, PSYZ_SPU_RAM_SIZE);
+    /* everything but SPU RAM: the state's fields after it */
+    _spu_RXX->rxx.spustat = 0;
+    for (int v = 0; v < PSYZ_SPU_NUM_VOICES; v++) {
+        _spu_RXX->rxx.voice[v].volumex = 0;
+    }
+    memset((u8*)&spu + PSYZ_SPU_RAM_SIZE, 0, sizeof(spu) - PSYZ_SPU_RAM_SIZE);
 }
 
 void Psyz_SpuReset(int hot) {
