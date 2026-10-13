@@ -467,7 +467,23 @@ typedef struct {
     int px, py;       // page origin in VRAM, halfwords
     int vshift;       // log2 of the page's row stride in halfwords (10, or less in a mip level)
     int umask, vmask; // texel coordinate wrap (0xFF, or less in a mip level)
+    int uor, vor;     // GP0 E2 texture window: u = (u & umask) | uor
 } Tex;
+
+/* GP0 E2, the texture window, per core like the rest of the drawing state:
+ * texcoord = (texcoord & ~(mask * 8)) | ((offset & mask) * 8). All zero
+ * (the default) is no window. */
+typedef struct { int uand, uor, vand, vor; } TexWindow;
+static TexWindow tw_c[2] = {{0xFF, 0, 0xFF, 0}, {0xFF, 0, 0xFF, 0}};
+#define tw tw_c[soft_core()]
+void Draw_SetTextureWindowE2(unsigned int e2) {
+    const int mx = e2 & 0x1F, my = (e2 >> 5) & 0x1F;
+    const int ox = (e2 >> 10) & 0x1F, oy = (e2 >> 15) & 0x1F;
+    tw.uand = 0xFF & ~(mx << 3);
+    tw.uor = (ox & mx) << 3;
+    tw.vand = 0xFF & ~(my << 3);
+    tw.vor = (oy & my) << 3;
+}
 
 static inline Tex tex_from(u16 tpage, u16 clut) {
     Tex t;
@@ -482,7 +498,10 @@ static inline Tex tex_from(u16 tpage, u16 clut) {
     t.px = px;
     t.py = py;
     t.vshift = 10;
-    t.umask = t.vmask = 0xFF;
+    t.umask = tw.uand;
+    t.vmask = tw.vand;
+    t.uor = tw.uor;
+    t.vor = tw.vor;
 #ifdef SOFT_TILED_TEX
     /* the page covers 1, 2 or 4 columns of 64 halfwords */
     tex_sync_page(px, py, 1 << (t.bpp > 2 ? 2 : t.bpp));
@@ -524,14 +543,15 @@ static void tex_mip(Tex* t, int k) {
     t->vshift = 10 - k;
     t->umask = 0xFF >> k;
     t->vmask = 0xFF >> k;
+    t->uor = t->vor = 0; /* (minified triangles ignore a texture window) */
 }
 #endif
 
 static inline u16 tex_fetch(const Tex* t, int u, int v) {
     const int vshift = t->vshift;
     (void)vshift;
-    u &= t->umask;
-    v &= t->vmask;
+    u = (u & t->umask) | t->uor;
+    v = (v & t->vmask) | t->vor;
     switch (t->bpp) {
     case 0: { // 4bpp: 4 texels per halfword
         u16 hw = TEX_HW(t->tbase, t->page, u >> 2, v);
@@ -652,7 +672,7 @@ SOFT_RASTER_IRAM static void raster_sprite(const SV* v, int w, int h, u16 tpage,
     tex_mark_dirty(x0 + i0, y0 + j0, x0 + i1, y0 + j1);
     for (int j = j0; j <= j1; j++) {
         u16* row = vram + (y0 + j) * VRAM_W;
-        int tv = (v->v + j) & 0xFF;
+        int tv = ((v->v + j) & t.vmask) | t.vor;
         int i = i0;
         if (t.bpp == 0) {
             // 4bpp: one halfword read serves four texels
@@ -665,7 +685,7 @@ SOFT_RASTER_IRAM static void raster_sprite(const SV* v, int w, int h, u16 tpage,
                 ((v->u + i0) & 3) == 0 && ((i1 - i0) & 3) == 3) {
                 u16* dst = &row[x0 + i0];
                 for (int n = i0; n <= i1; n += 4) {
-                    u16 hw = TEX_HW(t.tbase, t.page, ((v->u + n) & 0xFF) >> 2, tv);
+                    u16 hw = TEX_HW(t.tbase, t.page, (((v->u + n) & t.umask) | t.uor) >> 2, tv);
                     u16 a = t.clut[hw & 0xF];
                     u16 b = t.clut[(hw >> 4) & 0xF];
                     u16 c = t.clut[(hw >> 8) & 0xF];
@@ -687,7 +707,9 @@ SOFT_RASTER_IRAM static void raster_sprite(const SV* v, int w, int h, u16 tpage,
                 continue;
             }
             while (i <= i1) {
-                int u = (v->u + i) & 0xFF;
+                /* (a window is a multiple of 8 texels wide: the run of up to
+                 * four texels in one halfword never crosses its edge) */
+                int u = ((v->u + i) & t.umask) | t.uor;
                 u16 hw = TEX_HW(t.tbase, t.page, u >> 2, tv);
                 int nib = u & 3;
                 do {
@@ -784,6 +806,7 @@ static inline __attribute__((always_inline)) void tex_span_body(
     const u16* __restrict page = t->page;
     const int tbase = t->tbase;
     const int vshift = t->vshift, umask = t->umask, vmask = t->vmask;
+    const int uor = t->uor, vor = t->vor;
     (void)page;
     (void)tbase;
     (void)vshift;
@@ -797,8 +820,8 @@ static inline __attribute__((always_inline)) void tex_span_body(
     const int mchk = st.mask_check;
     const u16 mor = st.mask_or;
     for (int n = sp->n; n > 0; n--, dst++, ui += udx, vi += vdx) {
-        const int u = (ui >> 16) & umask;
-        const int v = (vi >> 16) & vmask;
+        const int u = ((ui >> 16) & umask) | uor;
+        const int v = ((vi >> 16) & vmask) | vor;
         u16 texel;
         if (bpp == 0) {
             const u16 hw = TEX_HW(tbase, page, u >> 2, v);
@@ -1092,6 +1115,7 @@ void Draw_Benchmark(void) {
         pages[i].py = 0;
         pages[i].vshift = 10;
         pages[i].umask = pages[i].vmask = 0xFF;
+        pages[i].uor = pages[i].vor = 0;
     }
     u16* dst = vram + 256 * VRAM_W;
     const int32_t one = 1 << 16;
