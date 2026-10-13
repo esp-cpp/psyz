@@ -123,6 +123,9 @@ typedef struct {
     // Capture buffer position
     u16 capture_pos;
 
+    // bit v: voice v is active (spu_tick visits only these)
+    unsigned active_mask;
+
     VoiceState voice[PSYZ_SPU_NUM_VOICES];
 
     // CD audio ring buffer, refilled by Psyz_CdPullSamples
@@ -247,6 +250,7 @@ static void spu_key_on_voice(int v) {
     // We do not reset vs->gpos at key-on for accuracy. On real PS1 hardware,
     // a voice on will carry the residual state from prior voice activity
     vs->active = 1;
+    spu.active_mask |= 1u << v;
 
     // reset the envelope to a fresh attack from zero
     vs->adsr_lo = rxx->voice[v].adsr[0];
@@ -384,6 +388,7 @@ static int voice_decode_one_sample(VoiceState* vs) {
         if (!vs->needs_decode && (vs->block_flags & 0x01)) {
             if (!(vs->block_flags & 0x02)) {
                 vs->active = 0;
+                spu.active_mask &= ~(1u << (vs - spu.voice));
                 vs->gwin[vs->gpos] = 0;
                 vs->gpos = (vs->gpos + 1) & 3;
                 return 0;
@@ -518,6 +523,7 @@ static void voice_envelope_step(VoiceState* vs) {
                 vs->env_vol = 0;
                 vs->env_state = ADSR_OFF;
                 vs->active = 0;
+                spu.active_mask &= ~(1u << (vs - spu.voice));
             }
         }
         break;
@@ -607,7 +613,8 @@ static void spu_tick(short* out) {
     // decode+resample, scale volume by ADSR envelope, then mix voices
     short v1_sample = 0, v3_sample = 0;
     unsigned active = 0;
-    for (int v = 0; v < PSYZ_SPU_NUM_VOICES; v++) {
+    for (unsigned m = spu.active_mask; m; m &= m - 1) {
+        const int v = __builtin_ctz(m);
         if (!spu.voice[v].active)
             continue;
         active++;
