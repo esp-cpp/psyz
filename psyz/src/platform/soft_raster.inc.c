@@ -175,6 +175,11 @@ void Draw_TiledInit(void) {
 void** Draw_TiledSlot(void) { return (void**)&vram_tiled; } /* for save states */
 #else
 #define TEX_HW(tbase, page, hx, v) (page)[((v) << vshift) + (hx)]
+#ifdef SOFT_MIP_TEX
+#define TEX_VSHIFT(t) ((t)->vshift)
+#else
+#define TEX_VSHIFT(t) 10 /* a page row is always 1024 halfwords: a constant shift */
+#endif
 void Draw_TiledInit(void) {}
 static void* tiled_none;
 void** Draw_TiledSlot(void) { return &tiled_none; }
@@ -794,6 +799,9 @@ SOFT_RASTER_IRAM static void raster_tile(const SV* v, int w, int h, int semi, in
 // literal arguments becomes its own straight-line loop. Pixel semantics are
 // those of put_texel (texel 0 never drawn, STP-gated blending, 0x80 neutral
 // modulation), so output is bit-exact with the generic loop.
+#ifndef TEX_VSHIFT
+#define TEX_VSHIFT(t) ((t)->vshift)
+#endif
 typedef struct {
     u16* dst;
     int n;
@@ -809,7 +817,7 @@ static inline __attribute__((always_inline)) void tex_span_body(
     u16* __restrict dst = sp->dst;
     const u16* __restrict page = t->page;
     const int tbase = t->tbase;
-    const int vshift = t->vshift, umask = t->umask, vmask = t->vmask;
+    const int vshift = TEX_VSHIFT(t), umask = t->umask, vmask = t->vmask;
     const int uor = t->uor, vor = t->vor;
     (void)page;
     (void)tbase;
@@ -1233,7 +1241,7 @@ static inline __attribute__((always_inline)) void tex_span_pre4(
     u16* __restrict dst = sp->dst;
     const u16* __restrict page = t->page;
     const int tbase = t->tbase;
-    const int vshift = t->vshift, umask = t->umask, vmask = t->vmask;
+    const int vshift = TEX_VSHIFT(t), umask = t->umask, vmask = t->vmask;
     const int uor = t->uor, vor = t->vor;
     (void)page; (void)tbase; (void)vshift;
     const int abr = t->abr;
