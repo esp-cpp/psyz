@@ -1165,6 +1165,87 @@ void Draw_Benchmark(void) {
 #undef TEX_SPAN_CASE
 #undef TEX_SPAN_CASES_BPP
 
+/* A textured triangle's rows, one loop per (bpp, shading, blending,
+ * modulation) chosen once per triangle: a row then costs its edge step and
+ * its start values, not a span descriptor and a dispatch (TPM's triangles
+ * average under seven pixels a row). Stepping and pixels are exactly those
+ * of the per-row dispatch. */
+typedef struct {
+    EdgeDDA* edges;
+    int minx, maxx, miny, maxy;
+    int32_t rrow, grow, brow, urow, vrow;
+    int32_t rdx, rdy, gdx, gdy, bdx, bdy, udx, udy, vdx, vdy;
+    int r8, g8, b8;
+    const u16* lut;
+} TriRows;
+
+static inline __attribute__((always_inline)) void tex_rows_body(
+    const Tex* t, const TriRows* q, const int bpp, const int gouraud,
+    const int semi, const int modulate) {
+    int32_t rrow = q->rrow, grow = q->grow, brow = q->brow, urow = q->urow, vrow = q->vrow;
+    const int32_t lim = 0x81 << 16;
+    for (int y = q->miny; y <= q->maxy; y++, rrow += q->rdy, grow += q->gdy, brow += q->bdy,
+             urow += q->udy, vrow += q->vdy) {
+        int xl, xr;
+        if (!edge_row(q->edges, q->minx, q->maxx, &xl, &xr)) {
+            continue;
+        }
+        const int off = xl - q->minx;
+        TexSpan sp;
+        sp.dst = vram + y * VRAM_W + xl;
+        sp.n = xr - xl + 1;
+        sp.ui = urow + off * q->udx;
+        sp.vi = vrow + off * q->vdx;
+        sp.udx = q->udx;
+        sp.vdx = q->vdx;
+        sp.r8 = q->r8;
+        sp.g8 = q->g8;
+        sp.b8 = q->b8;
+        sp.lut = q->lut;
+        if (gouraud) {
+            sp.ri = rrow + off * q->rdx;
+            sp.gi = grow + off * q->gdx;
+            sp.bi = brow + off * q->bdx;
+            sp.rdx = q->rdx;
+            sp.gdx = q->gdx;
+            sp.bdx = q->bdx;
+            /* the colour is linear along the span: it exceeds neutral
+             * somewhere only if it does at an end */
+            const int32_t n1 = sp.n - 1;
+            if (sp.ri >= lim || sp.gi >= lim || sp.bi >= lim || sp.ri + sp.rdx * n1 >= lim ||
+                sp.gi + sp.gdx * n1 >= lim || sp.bi + sp.bdx * n1 >= lim) {
+                tex_span_body(t, &sp, bpp, 1, semi, 1, 1);
+            } else {
+                tex_span_body(t, &sp, bpp, 1, semi, 1, 0);
+            }
+        } else {
+            sp.ri = sp.gi = sp.bi = sp.rdx = sp.gdx = sp.bdx = 0;
+            tex_span_body(t, &sp, bpp, 0, semi, modulate, 0);
+        }
+    }
+}
+#define TEX_ROWS_FN(bpp, g, s, m)                                              \
+    SOFT_SPAN_IRAM static void tex_rows_##bpp##g##s##m(const Tex* t, const TriRows* q) { \
+        tex_rows_body(t, q, bpp, g, s, m);                                     \
+    }
+#define TEX_ROWS_FNS(bpp)                                                      \
+    TEX_ROWS_FN(bpp, 0, 0, 0) TEX_ROWS_FN(bpp, 0, 0, 1) TEX_ROWS_FN(bpp, 0, 1, 0) \
+    TEX_ROWS_FN(bpp, 0, 1, 1) TEX_ROWS_FN(bpp, 1, 0, 1) TEX_ROWS_FN(bpp, 1, 1, 1)
+TEX_ROWS_FNS(0)
+TEX_ROWS_FNS(1)
+TEX_ROWS_FNS(2)
+typedef void (*TexRowsFn)(const Tex*, const TriRows*);
+/* [bpp][gouraud][semi][modulate]; gouraud always modulates */
+static TexRowsFn const tex_rows_fns[3][2][2][2] = {
+    {{{tex_rows_0000, tex_rows_0001}, {tex_rows_0010, tex_rows_0011}},
+     {{tex_rows_0101, tex_rows_0101}, {tex_rows_0111, tex_rows_0111}}},
+    {{{tex_rows_1000, tex_rows_1001}, {tex_rows_1010, tex_rows_1011}},
+     {{tex_rows_1101, tex_rows_1101}, {tex_rows_1111, tex_rows_1111}}},
+    {{{tex_rows_2000, tex_rows_2001}, {tex_rows_2010, tex_rows_2011}},
+     {{tex_rows_2101, tex_rows_2101}, {tex_rows_2111, tex_rows_2111}}},
+};
+int psyz_tex_rows = 1; /* 0: the per-row dispatch (reference) */
+
 SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, int textured,
                        u16 tpage, u16 clut, int semi, int gouraud) {
 #if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
@@ -1486,6 +1567,14 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
 #endif
 
     if (psyz_bench_skip == 2) return;
+    if (textured && psyz_tex_rows && psyz_bench_skip != 1 && psyz_bench_skip != 4) {
+        const TriRows q = {edges, minx, maxx, miny, maxy, rrow, grow, brow, urow, vrow,
+                           rdx, rdy, gdx, gdy, bdx, bdy, udx, udy, vdx, vdy,
+                           a->r, a->g, a->b, mod_lut};
+        const int bpp = t.bpp > 2 ? 2 : t.bpp;
+        tex_rows_fns[bpp][gouraud ? 1 : 0][semi ? 1 : 0][tex_mode ? 1 : 0](&t, &q);
+        return;
+    }
     // Fast path for the dominant WRP case: opaque untextured spans (the big
     // gouraud background quads). Span bounds come from the edge functions
     // directly (three divides per row on the LX7's hardware divider), the
