@@ -903,11 +903,20 @@ static inline __attribute__((always_inline)) void tex_span_body(
 #define SOFT_SPAN_IRAM SOFT_RASTER_IRAM /* the span loops alone (a shell short of IRAM) */
 #endif
 /* benchmarks: 1 skips the span pixels, 2 everything after a triangle's
- * setup, 3 the triangles (what is left is the parsing around them) */
+ * setup, 3 the triangles (what is left is the parsing around them), 4 draws
+ * the span pixels into a row of internal RAM instead of VRAM */
 int psyz_bench_skip;
 SOFT_SPAN_IRAM static void tex_span_dispatch(const Tex* t, const TexSpan* sp,
                                                int gouraud, int semi, int modulate) {
     if (psyz_bench_skip == 1) return;
+    TexSpan scratch_sp;
+    if (psyz_bench_skip == 4) {
+        /* timing only: the pixels go to a row in internal RAM, not VRAM */
+        static u16 scratch_row[1024] = {1};
+        scratch_sp = *sp;
+        scratch_sp.dst = scratch_row + 64;
+        sp = &scratch_sp;
+    }
     int bpp = t->bpp > 2 ? 2 : t->bpp;
     int clamp = 0;
     if (gouraud) {
@@ -962,6 +971,12 @@ int psyz_grad_float = 1; /* 0: exact reciprocal gradients (reference) */
 static inline long long div_area_16_fast(long long num, int area, float inv_area_f) {
     const int neg = num < 0;
     const unsigned long long mag = (unsigned long long)(neg ? -num : num);
+    if (mag < (1u << 15) && area < (1 << 16)) {
+        /* the small triangles' case: the whole division fits 32 bits, one
+         * hardware divide, the same rounding */
+        const uint32_t q32 = (((uint32_t)mag << 16) + (uint32_t)area / 2) / (uint32_t)area;
+        return neg ? -(long long)q32 : (long long)q32;
+    }
     const unsigned long long m = (mag << 16) + (unsigned long long)area / 2;
     unsigned long long q;
     if (mag < (1ull << 31)) {
@@ -1275,12 +1290,20 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     edge_dda_init(&edges[0], A0, B0, w0row);
     edge_dda_init(&edges[1], A1, B1, w1row);
     edge_dda_init(&edges[2], A2, B2, w2row);
-    u16 mod_lut[96];
+    /* flat modulation's table: kept per core, rebuilt only when the colour
+     * changes (a 96-entry rebuild cost more than drawing a small triangle) */
+    static u16 mod_lut_c[2][96];
+    static int mod_key_c[2] = {-1, -1};
+    u16* const mod_lut = mod_lut_c[soft_core()];
     if (textured && tex_mode && !gouraud) {
-        for (int i = 0; i < 32; i++) {
-            mod_lut[i] = (u16)mod5(i, a->r);
-            mod_lut[32 + i] = (u16)(mod5(i, a->g) << 5);
-            mod_lut[64 + i] = (u16)(mod5(i, a->b) << 10);
+        const int key = a->r | (a->g << 8) | (a->b << 16);
+        if (key != mod_key_c[soft_core()]) {
+            mod_key_c[soft_core()] = key;
+            for (int i = 0; i < 32; i++) {
+                mod_lut[i] = (u16)mod5(i, a->r);
+                mod_lut[32 + i] = (u16)(mod5(i, a->g) << 5);
+                mod_lut[64 + i] = (u16)(mod5(i, a->b) << 10);
+            }
         }
     }
 
