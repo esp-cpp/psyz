@@ -1622,6 +1622,23 @@ static void soft_clear_image(const PS1_RECT* rect, u8 r, u8 g, u8 b) {
             continue; /* the other worker's rows */
         }
         u16* row = vram + yy * VRAM_W;
+        if (rect->x + w <= VRAM_W) {
+            /* no wrap (the usual frame clear): words, not masked halfwords */
+            u16* p = row + rect->x;
+            int n = w;
+            if (((uintptr_t)p & 2) && n) {
+                *p++ = c;
+                n--;
+            }
+            u32* q = (u32*)p;
+            const u32 cc = (u32)c | ((u32)c << 16);
+            for (; n >= 8; n -= 8, q += 4) {
+                q[0] = cc; q[1] = cc; q[2] = cc; q[3] = cc;
+            }
+            for (; n >= 2; n -= 2) *q++ = cc;
+            if (n) *(u16*)q = c;
+            continue;
+        }
         for (int x = 0; x < w; x++) {
             row[(rect->x + x) & (VRAM_W - 1)] = c;
         }
