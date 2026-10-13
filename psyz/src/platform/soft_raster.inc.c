@@ -914,6 +914,7 @@ static inline __attribute__((always_inline)) void tex_span_body(
  * setup, 3 the triangles (what is left is the parsing around them), 4 draws
  * the span pixels into a row of internal RAM instead of VRAM */
 int psyz_bench_skip;
+u16* psyz_bench_page; /* mode 5's internal-RAM texture page */
 SOFT_SPAN_IRAM static void tex_span_dispatch(const Tex* t, const TexSpan* sp,
                                                int gouraud, int semi, int modulate) {
     if (psyz_bench_skip == 1) return;
@@ -924,6 +925,16 @@ SOFT_SPAN_IRAM static void tex_span_dispatch(const Tex* t, const TexSpan* sp,
         scratch_sp = *sp;
         scratch_sp.dst = scratch_row + 64;
         sp = &scratch_sp;
+    }
+    Tex scratch_t;
+    if (psyz_bench_skip == 7 && psyz_bench_page) {
+        /* timing only: texels from 4 rows of a page in internal RAM (the
+         * bench allocates the 8 KB) */
+        scratch_t = *t;
+        scratch_t.page = psyz_bench_page;
+        scratch_t.vmask = 3;
+        scratch_t.vor &= 3;
+        t = &scratch_t;
     }
     int bpp = t->bpp > 2 ? 2 : t->bpp;
     int clamp = 0;
