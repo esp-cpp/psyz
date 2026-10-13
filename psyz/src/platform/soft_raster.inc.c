@@ -902,8 +902,12 @@ static inline __attribute__((always_inline)) void tex_span_body(
 #ifndef SOFT_SPAN_IRAM
 #define SOFT_SPAN_IRAM SOFT_RASTER_IRAM /* the span loops alone (a shell short of IRAM) */
 #endif
+/* benchmarks: 1 skips the span pixels, 2 everything after a triangle's
+ * setup, 3 the triangles (what is left is the parsing around them) */
+int psyz_bench_skip;
 SOFT_SPAN_IRAM static void tex_span_dispatch(const Tex* t, const TexSpan* sp,
                                                int gouraud, int semi, int modulate) {
+    if (psyz_bench_skip == 1) return;
     int bpp = t->bpp > 2 ? 2 : t->bpp;
     int clamp = 0;
     if (gouraud) {
@@ -1155,6 +1159,7 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     int bx = b->x + st.ox, by = b->y + st.oy;
     int cx = c->x + st.ox, cy = c->y + st.oy;
 
+    if (psyz_bench_skip == 3) return;
     int area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
     if (area == 0) {
         return;
@@ -1457,6 +1462,7 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     psyz_prof_n[5]++;
 #endif
 
+    if (psyz_bench_skip == 2) return;
     // Fast path for the dominant WRP case: opaque untextured spans (the big
     // gouraud background quads). Span bounds come from the edge functions
     // directly (three divides per row on the LX7's hardware divider), the
