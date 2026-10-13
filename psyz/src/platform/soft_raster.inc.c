@@ -28,6 +28,10 @@
 #ifdef ESP_PLATFORM
 #include "esp_cpu.h"
 static inline int soft_core(void) { return (int)esp_cpu_get_core_id(); }
+#elif defined(SOFT_RASTER_HOST_CORES)
+/* a desktop shell running two workers says which one each thread is */
+extern __thread int psyz_host_core;
+static inline int soft_core(void) { return psyz_host_core; }
 #else
 static inline int soft_core(void) { return 0; }
 #endif
