@@ -330,6 +330,9 @@ typedef struct {
 #define SOFT_RASTER_IRAM
 #endif
 
+#ifndef SOFT_CLUT_CACHE_CAPS
+#define SOFT_CLUT_CACHE_CAPS MALLOC_CAP_INTERNAL /* where the board keeps the CLUT cache */
+#endif
 #ifdef SOFT_CLUT_CACHE
 // 8-way store of recently used CLUTs (4KB DRAM). Texel fetches then cost one
 // PSRAM read instead of two. Any VRAM image op invalidates everything - CLUT
@@ -403,7 +406,7 @@ void Draw_FlushCaches(void) {
 static inline const u16* clut_cached(u16 id, const u16* src, int n) {
 #ifdef ESP_PLATFORM
     if (!clut_cache) {
-        clut_cache = heap_caps_malloc(8 * 256 * sizeof(u16), MALLOC_CAP_INTERNAL);
+        clut_cache = heap_caps_malloc(8 * 256 * sizeof(u16), SOFT_CLUT_CACHE_CAPS);
         if (!clut_cache) {
             return src;
         }
