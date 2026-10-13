@@ -1226,11 +1226,16 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
 
     if (minx < st.x0) minx = st.x0;
     if (maxx > st.x1) maxx = st.x1;
+    /* the row a single worker starts its attribute stepping on (clipped to
+     * the draw area, not to this worker's band): the band's first row steps
+     * from there, so two workers' pixels are those of one */
+    int step_y0 = miny < st.area_y0 ? st.area_y0 : miny;
     if (miny < st.y0) miny = st.y0;
     if (maxy > st.y1) maxy = st.y1;
     if (minx > maxx || miny > maxy) {
         return;
     }
+    if (step_y0 > miny) step_y0 = miny;
     tex_mark_dirty(minx, miny, maxx, maxy);
 
     // edge setup: E(x,y) >= 0 inside, top-left edges get the <0 bias on the
@@ -1366,19 +1371,21 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
 #else
 #define ROW0(p0, p1, p2) ((fx)(((s64)(e0r * (p0) + e1r * (p1) + e2r * (p2)) << 16) / area))
 #endif
+    const int band_k = miny - step_y0; /* rows from step_y0 to this band */
+    e0r -= B0 * band_k; e1r -= B1 * band_k; e2r -= B2 * band_k;
     if (gouraud) {
         GRAD(a->r, b->r, c->r) rdx = (fx)dx_; rdy = (fx)dy_;
         GRAD(a->g, b->g, c->g) gdx = (fx)dx_; gdy = (fx)dy_;
         GRAD(a->b, b->b, c->b) bdx = (fx)dx_; bdy = (fx)dy_;
-        rrow = ROW0(a->r, b->r, c->r);
-        grow = ROW0(a->g, b->g, c->g);
-        brow = ROW0(a->b, b->b, c->b);
+        rrow = ROW0(a->r, b->r, c->r) + rdy * band_k;
+        grow = ROW0(a->g, b->g, c->g) + gdy * band_k;
+        brow = ROW0(a->b, b->b, c->b) + bdy * band_k;
     }
     if (textured) {
         GRAD(a->u, b->u, c->u) udx = (fx)dx_; udy = (fx)dy_;
         GRAD(a->v, b->v, c->v) vdx = (fx)dx_; vdy = (fx)dy_;
-        urow = ROW0(a->u, b->u, c->u);
-        vrow = ROW0(a->v, b->v, c->v);
+        urow = ROW0(a->u, b->u, c->u) + udy * band_k;
+        vrow = ROW0(a->v, b->v, c->v) + vdy * band_k;
 #ifdef SOFT_MIP_TEX
         {
             /* texels per pixel along x and y, from the larger axis step */
@@ -1435,6 +1442,7 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
 #undef CHK
     }
 #endif
+    e0r += B0 * band_k; e1r += B1 * band_k; e2r += B2 * band_k;
 #undef GRAD
 #undef ROW0
 #if defined(SOFT_RASTER_RECIP)
