@@ -645,7 +645,7 @@ static inline void put_texel(u16* dst, u16 texel, int r8, int g8, int b8,
 
 static inline void put_flat(u16* dst, int r8, int g8, int b8, int semi,
                             int abr) {
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
     psyz_flat_px++;
 #endif
     int r = r8 >> 3, g = g8 >> 3, b = b8 >> 3;
@@ -755,7 +755,7 @@ SOFT_RASTER_IRAM static void raster_tile(const SV* v, int w, int h, int semi, in
         for (int y = ya; y <= yb; y++) {
             u16* p = vram + y * VRAM_W + xa;
             int n = xb - xa + 1;
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
             psyz_flat_px += (unsigned)(n > 0 ? n : 0);
 #endif
             if ((xa & 1) && n > 0) {   /* odd start: one halfword to align */
@@ -1145,7 +1145,7 @@ void Draw_Benchmark(void) {
 
 SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, int textured,
                        u16 tpage, u16 clut, int semi, int gouraud) {
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
     const uint32_t prof_setup_t0 = esp_cpu_get_cycle_count();
 #endif
     int ax = a->x + st.ox, ay = a->y + st.oy;
@@ -1165,7 +1165,7 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
         area = -area;
     }
 
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
     {
         /* one-shot: where is the rasterizer actually writing, and what is it
          * clipping to? Compare against the framebuffer the scanout reads. */
@@ -1184,7 +1184,7 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     int maxx = ax > bx ? (ax > cx ? ax : cx) : (bx > cx ? bx : cx);
     int miny = ay < by ? (ay < cy ? ay : cy) : (by < cy ? by : cy);
     int maxy = ay > by ? (ay > cy ? ay : cy) : (by > cy ? by : cy);
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
     {
         /* classify: is the world missing because it lands outside the screen,
          * or because it projects to sub-pixel size? */
@@ -1218,7 +1218,7 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
      * clip would shrink every one of them to screen size and hide exactly the
      * property being tested. */
     if ((maxx - minx) > 1023 || (maxy - miny) > 511) {
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
         psyz_tri_huge++;
 #endif
         return;
@@ -1250,11 +1250,11 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     Tex t;
     int tex_mode = 0;
     if (textured) {
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
         const uint32_t tf0 = esp_cpu_get_cycle_count();
 #endif
         t = tex_from(tpage, clut);
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
         psyz_prof_texfrom_cy += esp_cpu_get_cycle_count() - tf0;
 #endif
         tex_mode = (!gouraud && a->r == 0x80 && a->g == 0x80 && a->b == 0x80) ? 0 : 1;
@@ -1448,7 +1448,7 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
 #if defined(SOFT_RASTER_RECIP)
 #undef DIV_AREA_16
 #endif
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
     /* slot 5: the per-triangle setup, from entry to here */
     psyz_prof_cy[5] += esp_cpu_get_cycle_count() - prof_setup_t0;
     psyz_prof_n[5]++;
@@ -1532,7 +1532,7 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
             psyz_prof_px += (unsigned)sp.n;
 #else
             tex_span_dispatch(&t, &sp, gouraud, semi, tex_mode);
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
             psyz_prof_rows++;
             psyz_prof_px += (unsigned)sp.n;
 #endif
@@ -1801,7 +1801,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             }
         }
         {
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
             PROF_BEGIN();
             if (isTextured) {
                 Psyz_GpuFeedbackCheck(tpage);
@@ -1813,7 +1813,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
                 raster_tri(&v[1], &v[3], &v[2], isTextured, tpage, clut, isSemi,
                            isGouraud);
             }
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
             PROF_END(isTextured ? 0 : (isSemi ? 1 : 2));
 #endif
         }
@@ -1898,7 +1898,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             break;
         }
         {
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
             PROF_BEGIN();
 #endif
             if (isTextured) {
@@ -1909,7 +1909,7 @@ int Draw_PushPrim(u_long* packets, int max_len) {
             } else {
                 raster_tile(&v[0], w, h, isSemi, (cur_tpage >> 5) & 3);
             }
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) && !defined(SOFT_RASTER_NO_STATS)
             PROF_END(isTextured ? 3 : 4);
 #endif
         }
