@@ -1224,6 +1224,69 @@ static inline __attribute__((always_inline)) void tex_rows_body(
         }
     }
 }
+/* 4bpp, flat-modulated: the 16 palette entries modulated once per palette
+ * and colour (mclut), each entry the pixel to write with the texel's STP bit,
+ * or 0x10000 for a transparent texel. One load per pixel instead of the
+ * palette's and the three channel tables'. Exactly put_texel's pixels. */
+static inline __attribute__((always_inline)) void tex_span_pre4(
+    const Tex* t, const TexSpan* sp, const uint32_t* __restrict mclut, const int semi) {
+    u16* __restrict dst = sp->dst;
+    const u16* __restrict page = t->page;
+    const int tbase = t->tbase;
+    const int vshift = t->vshift, umask = t->umask, vmask = t->vmask;
+    const int uor = t->uor, vor = t->vor;
+    (void)page; (void)tbase; (void)vshift;
+    const int abr = t->abr;
+    int32_t ui = sp->ui, vi = sp->vi;
+    const int32_t udx = sp->udx, vdx = sp->vdx;
+    const int mchk = st.mask_check;
+    const u16 mor = st.mask_or;
+    for (int n = sp->n; n > 0; n--, dst++, ui += udx, vi += vdx) {
+        const int u = ((ui >> 16) & umask) | uor;
+        const int v = ((vi >> 16) & vmask) | vor;
+        const u16 hw = TEX_HW(tbase, page, u >> 2, v);
+        const uint32_t e = mclut[(hw >> ((u & 3) << 2)) & 0xF];
+        if (e & 0x10000) {
+            continue;
+        }
+        if (mchk && (*dst & 0x8000)) {
+            continue;
+        }
+        if (semi && (e & 0x8000)) {
+            *dst = blend5551(*dst, e & 0x1F, (e >> 5) & 0x1F, (e >> 10) & 0x1F, abr) | 0x8000 | mor;
+        } else {
+            *dst = (u16)e | mor;
+        }
+    }
+}
+static inline __attribute__((always_inline)) void tex_rows_pre4(const Tex* t, const TriRows* q,
+                                                                const int semi) {
+    int32_t urow = q->urow, vrow = q->vrow;
+    const uint32_t* mclut = (const uint32_t*)q->lut;
+    for (int y = q->miny; y <= q->maxy; y++, urow += q->udy, vrow += q->vdy) {
+        int xl, xr;
+        if (!edge_row(q->edges, q->minx, q->maxx, &xl, &xr)) {
+            continue;
+        }
+        const int off = xl - q->minx;
+        TexSpan sp;
+        sp.dst = vram + y * VRAM_W + xl;
+        sp.n = xr - xl + 1;
+        sp.ui = urow + off * q->udx;
+        sp.vi = vrow + off * q->vdx;
+        sp.udx = q->udx;
+        sp.vdx = q->vdx;
+        tex_span_pre4(t, &sp, mclut, semi);
+    }
+}
+SOFT_SPAN_IRAM static void tex_rows_pre4_0(const Tex* t, const TriRows* q) { tex_rows_pre4(t, q, 0); }
+SOFT_SPAN_IRAM static void tex_rows_pre4_1(const Tex* t, const TriRows* q) { tex_rows_pre4(t, q, 1); }
+/* the modulated palettes, per core; any VRAM write (uploads, moves, fills)
+ * moves the generation and drops them all */
+static unsigned mclut_gen = 1;
+static uint32_t mclut_c[2][16];
+static unsigned mclut_key_c[2][3];
+
 #define TEX_ROWS_FN(bpp, g, s, m)                                              \
     SOFT_SPAN_IRAM static void tex_rows_##bpp##g##s##m(const Tex* t, const TriRows* q) { \
         tex_rows_body(t, q, bpp, g, s, m);                                     \
@@ -1572,6 +1635,27 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
                            rdx, rdy, gdx, gdy, bdx, bdy, udx, udy, vdx, vdy,
                            a->r, a->g, a->b, mod_lut};
         const int bpp = t.bpp > 2 ? 2 : t.bpp;
+        if (bpp == 0 && tex_mode && !gouraud && psyz_tex_rows == 1) {
+            const int core = soft_core();
+            uint32_t* mc = mclut_c[core];
+            unsigned* key = mclut_key_c[core];
+            const unsigned ck = (unsigned)a->r | ((unsigned)a->g << 8) | ((unsigned)a->b << 16);
+            if (key[0] != mclut_gen || key[1] != clut || key[2] != ck) {
+                key[0] = mclut_gen;
+                key[1] = clut;
+                key[2] = ck;
+                for (int i = 0; i < 16; i++) {
+                    const u16 texel = t.clut[i];
+                    mc[i] = texel == 0 ? 0x10000u
+                                       : (uint32_t)(mod_lut[texel & 0x1F] | mod_lut[32 + ((texel >> 5) & 0x1F)] |
+                                                    mod_lut[64 + ((texel >> 10) & 0x1F)] | (texel & 0x8000));
+                }
+            }
+            TriRows qp = q;
+            qp.lut = (const u16*)mc;
+            (semi ? tex_rows_pre4_1 : tex_rows_pre4_0)(&t, &qp);
+            return;
+        }
         tex_rows_fns[bpp][gouraud ? 1 : 0][semi ? 1 : 0][tex_mode ? 1 : 0](&t, &q);
         return;
     }
@@ -1733,6 +1817,7 @@ static inline int vram_clamp_h(const PS1_RECT* rect) {
 }
 
 static void soft_clear_image(const PS1_RECT* rect, u8 r, u8 g, u8 b) {
+    mclut_gen++; /* modulated palettes may be stale */
     clut_cache_flush();
     u16 c = (u16)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
     int w = vram_clamp_w(rect, "clear"), h = vram_clamp_h(rect);
@@ -1767,6 +1852,7 @@ static void soft_clear_image(const PS1_RECT* rect, u8 r, u8 g, u8 b) {
 }
 
 static void soft_load_image(const PS1_RECT* rect, const u16* src) {
+    mclut_gen++; /* modulated palettes may be stale */
     if (!src) {
         // The PSX's DMA read open bus at address 0 and uploaded garbage
         // without complaint -- MGS's menu does exactly this on purpose
@@ -1802,6 +1888,7 @@ static void soft_store_image(const PS1_RECT* rect, u16* dst) {
 }
 
 static void soft_move_image(const PS1_RECT* rect, int dx, int dy) {
+    mclut_gen++; /* modulated palettes may be stale */
     clut_cache_flush();
     int w = vram_clamp_w(rect, "move"), h = vram_clamp_h(rect);
     // clip so both source and destination stay inside VRAM
