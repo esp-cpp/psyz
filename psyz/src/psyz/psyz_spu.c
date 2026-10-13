@@ -439,7 +439,8 @@ static void voice_envelope_step(VoiceState* vs) {
     // the PS1 SPU has an internal counter, shared across all states, that
     // allows to trigger a change based on the selected ADSR rate
     unsigned ctr = ++vs->env_counter;
-#define ADSR_FIRES(rate) ((ctr % adsr_denominator(rate)) == 0)
+/* the denominator is a power of two: a mask, not a divide per voice per sample */
+#define ADSR_FIRES(rate) ((ctr & (adsr_denominator(rate) - 1)) == 0)
 
     switch (vs->env_state) {
     case ADSR_ATTACK: {
