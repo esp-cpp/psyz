@@ -899,7 +899,10 @@ static inline __attribute__((always_inline)) void tex_span_body(
     TEX_SPAN_CASE(bpp, 1, 0, 1, 0) TEX_SPAN_CASE(bpp, 1, 1, 1, 0)              \
     TEX_SPAN_CASE(bpp, 1, 0, 1, 1) TEX_SPAN_CASE(bpp, 1, 1, 1, 1)
 
-SOFT_RASTER_IRAM static void tex_span_dispatch(const Tex* t, const TexSpan* sp,
+#ifndef SOFT_SPAN_IRAM
+#define SOFT_SPAN_IRAM SOFT_RASTER_IRAM /* the span loops alone (a shell short of IRAM) */
+#endif
+SOFT_SPAN_IRAM static void tex_span_dispatch(const Tex* t, const TexSpan* sp,
                                                int gouraud, int semi, int modulate) {
     int bpp = t->bpp > 2 ? 2 : t->bpp;
     int clamp = 0;
