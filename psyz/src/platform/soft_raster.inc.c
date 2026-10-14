@@ -814,9 +814,17 @@ typedef struct {
     const u16* lut; // flat modulation: [0..31] r, [32..63] g<<5, [64..95] b<<10
 } TexSpan;
 
+static inline __attribute__((always_inline)) void tex_span_body_m(
+    const Tex* t, const TexSpan* sp, const int bpp, const int gouraud,
+    const int semi, const int modulate, const int clamp, const int mchk, const u16 mor);
 static inline __attribute__((always_inline)) void tex_span_body(
     const Tex* t, const TexSpan* sp, const int bpp, const int gouraud,
     const int semi, const int modulate, const int clamp) {
+    tex_span_body_m(t, sp, bpp, gouraud, semi, modulate, clamp, st.mask_check, st.mask_or);
+}
+static inline __attribute__((always_inline)) void tex_span_body_m(
+    const Tex* t, const TexSpan* sp, const int bpp, const int gouraud,
+    const int semi, const int modulate, const int clamp, const int mchk, const u16 mor) {
     u16* __restrict dst = sp->dst;
     const u16* __restrict page = t->page;
     const int tbase = t->tbase;
@@ -832,8 +840,6 @@ static inline __attribute__((always_inline)) void tex_span_body(
     int32_t ri = sp->ri, gi = sp->gi, bi = sp->bi;
     const int32_t rdx = sp->rdx, gdx = sp->gdx, bdx = sp->bdx;
     const u16* __restrict lut = sp->lut;
-    const int mchk = st.mask_check;
-    const u16 mor = st.mask_or;
     for (int n = sp->n; n > 0; n--, dst++, ui += udx, vi += vdx) {
         const int u = ((ui >> 16) & umask) | uor;
         const int v = ((vi >> 16) & vmask) | vor;
@@ -1192,8 +1198,68 @@ void Draw_Benchmark(void) {
  * its start values, not a span descriptor and a dispatch (TPM's triangles
  * average under seven pixels a row). Stepping and pixels are exactly those
  * of the per-row dispatch. */
+/* The three edges of a triangle sorted once into two left-bound slots, two
+ * right-bound slots and one horizontal slot (unused slots neutral), so the
+ * row loop steps them in registers with no per-edge branching on kind. The
+ * stepping is edge_row's, exactly. */
+typedef struct {
+    int ql0, rl0, dql0, drl0, al0, ql1, rl1, dql1, drl1, al1;
+    int qr0, rr0, dqr0, drr0, ar0, qr1, rr1, dqr1, drr1, ar1;
+    int qf, dqf;
+} Edges2;
+static int edges2_init(const EdgeDDA* e, Edges2* s) {
+    int nl = 0, nr = 0, nf = 0;
+    s->ql0 = s->ql1 = -0x40000000;
+    s->qr0 = s->qr1 = 0x40000000;
+    s->rl0 = s->rl1 = s->rr0 = s->rr1 = 0;
+    s->dql0 = s->dql1 = s->dqr0 = s->dqr1 = 0;
+    s->drl0 = s->drl1 = s->drr0 = s->drr1 = 0;
+    s->al0 = s->al1 = s->ar0 = s->ar1 = 1;
+    s->qf = 0;
+    s->dqf = 0;
+    for (int i = 0; i < 3; i++) {
+        const EdgeDDA* d = &e[i];
+        if (d->kind == 2) {
+            if (nf++) return 0;
+            s->qf = d->q;
+            s->dqf = d->dq;
+        } else if (d->kind == 0) {
+            if (nl == 0) { s->ql0 = d->q; s->rl0 = d->r; s->dql0 = d->dq; s->drl0 = d->dr; s->al0 = d->A; }
+            else if (nl == 1) { s->ql1 = d->q; s->rl1 = d->r; s->dql1 = d->dq; s->drl1 = d->dr; s->al1 = d->A; }
+            else return 0;
+            nl++;
+        } else {
+            if (nr == 0) { s->qr0 = d->q; s->rr0 = d->r; s->dqr0 = d->dq; s->drr0 = d->dr; s->ar0 = d->A; }
+            else if (nr == 1) { s->qr1 = d->q; s->rr1 = d->r; s->dqr1 = d->dq; s->drr1 = d->dr; s->ar1 = d->A; }
+            else return 0;
+            nr++;
+        }
+    }
+    return 1;
+}
+#define EDGE2_STEP(q, r, dq, dr, a) do { (q) += (dq); (r) += (dr); if ((r) >= (a)) { (r) -= (a); (q)++; } } while (0)
+static inline __attribute__((always_inline)) int edges2_row(Edges2* s, int minx, int maxx, int* pxl, int* pxr) {
+    const int ok = s->qf >= 0;
+    s->qf += s->dqf;
+    int xl = minx, xr = maxx;
+    if (minx + s->ql0 > xl) xl = minx + s->ql0;
+    if (minx + s->ql1 > xl) xl = minx + s->ql1;
+    if (minx + s->qr0 < xr) xr = minx + s->qr0;
+    if (minx + s->qr1 < xr) xr = minx + s->qr1;
+    EDGE2_STEP(s->ql0, s->rl0, s->dql0, s->drl0, s->al0);
+    EDGE2_STEP(s->ql1, s->rl1, s->dql1, s->drl1, s->al1);
+    EDGE2_STEP(s->qr0, s->rr0, s->dqr0, s->drr0, s->ar0);
+    EDGE2_STEP(s->qr1, s->rr1, s->dqr1, s->drr1, s->ar1);
+    *pxl = xl;
+    *pxr = xr;
+    return ok && xl <= xr;
+}
+
 typedef struct {
     EdgeDDA* edges;
+    Edges2 e2;
+    int mchk;
+    u16 mor;
     int minx, maxx, miny, maxy;
     int32_t rrow, grow, brow, urow, vrow;
     int32_t rdx, rdy, gdx, gdy, bdx, bdy, udx, udy, vdx, vdy;
@@ -1206,10 +1272,14 @@ static inline __attribute__((always_inline)) void tex_rows_body(
     const int semi, const int modulate) {
     int32_t rrow = q->rrow, grow = q->grow, brow = q->brow, urow = q->urow, vrow = q->vrow;
     const int32_t lim = 0x81 << 16;
+    Edges2 e2 = q->e2;
+    const int mchk = q->mchk;
+    const u16 mor = q->mor;
+    const int minx = q->minx, maxx = q->maxx;
     for (int y = q->miny; y <= q->maxy; y++, rrow += q->rdy, grow += q->gdy, brow += q->bdy,
              urow += q->udy, vrow += q->vdy) {
         int xl, xr;
-        if (!edge_row(q->edges, q->minx, q->maxx, &xl, &xr)) {
+        if (!edges2_row(&e2, minx, maxx, &xl, &xr)) {
             continue;
         }
         const int off = xl - q->minx;
@@ -1236,13 +1306,13 @@ static inline __attribute__((always_inline)) void tex_rows_body(
             const int32_t n1 = sp.n - 1;
             if (sp.ri >= lim || sp.gi >= lim || sp.bi >= lim || sp.ri + sp.rdx * n1 >= lim ||
                 sp.gi + sp.gdx * n1 >= lim || sp.bi + sp.bdx * n1 >= lim) {
-                tex_span_body(t, &sp, bpp, 1, semi, 1, 1);
+                tex_span_body_m(t, &sp, bpp, 1, semi, 1, 1, mchk, mor);
             } else {
-                tex_span_body(t, &sp, bpp, 1, semi, 1, 0);
+                tex_span_body_m(t, &sp, bpp, 1, semi, 1, 0, mchk, mor);
             }
         } else {
             sp.ri = sp.gi = sp.bi = sp.rdx = sp.gdx = sp.bdx = 0;
-            tex_span_body(t, &sp, bpp, 0, semi, modulate, 0);
+            tex_span_body_m(t, &sp, bpp, 0, semi, modulate, 0, mchk, mor);
         }
     }
 }
@@ -1251,7 +1321,8 @@ static inline __attribute__((always_inline)) void tex_rows_body(
  * or 0x10000 for a transparent texel. One load per pixel instead of the
  * palette's and the three channel tables'. Exactly put_texel's pixels. */
 static inline __attribute__((always_inline)) void tex_span_pre4(
-    const Tex* t, const TexSpan* sp, const uint32_t* __restrict mclut, const int semi) {
+    const Tex* t, const TexSpan* sp, const uint32_t* __restrict mclut, const int semi,
+    const int mchk, const u16 mor) {
     u16* __restrict dst = sp->dst;
     const u16* __restrict page = t->page;
     const int tbase = t->tbase;
@@ -1261,8 +1332,6 @@ static inline __attribute__((always_inline)) void tex_span_pre4(
     const int abr = t->abr;
     int32_t ui = sp->ui, vi = sp->vi;
     const int32_t udx = sp->udx, vdx = sp->vdx;
-    const int mchk = st.mask_check;
-    const u16 mor = st.mask_or;
     for (int n = sp->n; n > 0; n--, dst++, ui += udx, vi += vdx) {
         const int u = ((ui >> 16) & umask) | uor;
         const int v = ((vi >> 16) & vmask) | vor;
@@ -1285,20 +1354,25 @@ static inline __attribute__((always_inline)) void tex_rows_pre4(const Tex* t, co
                                                                 const int semi) {
     int32_t urow = q->urow, vrow = q->vrow;
     const uint32_t* mclut = (const uint32_t*)q->lut;
-    for (int y = q->miny; y <= q->maxy; y++, urow += q->udy, vrow += q->vdy) {
+    Edges2 e2 = q->e2;
+    const int mchk = q->mchk;
+    const u16 mor = q->mor;
+    const int minx = q->minx, maxx = q->maxx;
+    const int32_t udx = q->udx, vdx = q->vdx, udy = q->udy, vdy = q->vdy;
+    for (int y = q->miny; y <= q->maxy; y++, urow += udy, vrow += vdy) {
         int xl, xr;
-        if (!edge_row(q->edges, q->minx, q->maxx, &xl, &xr)) {
+        if (!edges2_row(&e2, minx, maxx, &xl, &xr)) {
             continue;
         }
-        const int off = xl - q->minx;
+        const int off = xl - minx;
         TexSpan sp;
         sp.dst = vram + y * VRAM_W + xl;
         sp.n = xr - xl + 1;
-        sp.ui = urow + off * q->udx;
-        sp.vi = vrow + off * q->vdx;
-        sp.udx = q->udx;
-        sp.vdx = q->vdx;
-        tex_span_pre4(t, &sp, mclut, semi);
+        sp.ui = urow + off * udx;
+        sp.vi = vrow + off * vdx;
+        sp.udx = udx;
+        sp.vdx = vdx;
+        tex_span_pre4(t, &sp, mclut, semi, mchk, mor);
     }
 }
 SOFT_SPAN_IRAM static void tex_rows_pre4_0(const Tex* t, const TriRows* q) { tex_rows_pre4(t, q, 0); }
@@ -1652,8 +1726,11 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
 #endif
 
     if (psyz_bench_skip == 2) return;
-    if (textured && psyz_tex_rows && psyz_bench_skip != 1 && psyz_bench_skip != 4) {
-        const TriRows q = {edges, minx, maxx, miny, maxy, rrow, grow, brow, urow, vrow,
+    Edges2 e2;
+    if (textured && psyz_tex_rows && psyz_edge_dda && psyz_bench_skip != 1 && psyz_bench_skip != 4 &&
+        edges2_init(edges, &e2)) {
+        const TriRows q = {edges, e2, st.mask_check, st.mask_or, minx, maxx, miny, maxy,
+                           rrow, grow, brow, urow, vrow,
                            rdx, rdy, gdx, gdy, bdx, bdy, udx, udy, vdx, vdy,
                            a->r, a->g, a->b, mod_lut};
         const int bpp = t.bpp > 2 ? 2 : t.bpp;
