@@ -990,21 +990,13 @@ int psyz_grad_float = 1; /* 0: exact reciprocal gradients (reference) */
  * pixel centres, so a quotient one unit short picks the neighbouring texel
  * row for a whole triangle (the opening's dark water wedges). Numerators
  * the float path cannot hold take the division itself. */
-static inline long long div_area_16_fast(long long num, int area, float inv_area_f, uint32_t inv_area32) {
+static inline long long div_area_16_fast(long long num, int area, float inv_area_f) {
     const int neg = num < 0;
     const unsigned long long mag = (unsigned long long)(neg ? -num : num);
-    if (mag < 0xFFFFu && inv_area32) {
-        /* the small triangles' case: the dividend fits 32 bits. With
-         * inv_area32 = (2^32 - 1) / area (one divide per triangle) the
-         * multiply-high is at most two short of the quotient; the remainder
-         * test makes it exact, the same rounding as the division */
-        const uint32_t m = ((uint32_t)mag << 16) + (uint32_t)area / 2;
-        uint32_t q32 = (uint32_t)(((uint64_t)m * inv_area32) >> 32);
-        uint32_t r = m - q32 * (uint32_t)area;
-        while (r >= (uint32_t)area) {
-            q32++;
-            r -= (uint32_t)area;
-        }
+    if (mag < (1u << 15) && area < (1 << 16)) {
+        /* the small triangles' case: the whole division fits 32 bits, one
+         * hardware divide, the same rounding */
+        const uint32_t q32 = (((uint32_t)mag << 16) + (uint32_t)area / 2) / (uint32_t)area;
         return neg ? -(long long)q32 : (long long)q32;
     }
     const unsigned long long m = (mag << 16) + (unsigned long long)area / 2;
@@ -1033,26 +1025,6 @@ int psyz_grad_check;     /* >0: compare float and exact per triangle, print this
 static inline int floordiv_i(int n, int d) {
     return n >= 0 ? n / d : -((-n + d - 1) / d);
 }
-/* floor(n / d) for 0 < d < 512 without the divider: n times a float 1/d is
- * within one of the quotient (|n| < 2^22), the remainder makes it exact */
-#define EDGE_RECIP_N 512
-static float edge_recip[EDGE_RECIP_N];
-static inline int floordiv_r(int n, int d) {
-    if (d >= EDGE_RECIP_N) return floordiv_i(n, d);
-    if (__builtin_expect(edge_recip[1] == 0.0f, 0))
-        for (int i = 1; i < EDGE_RECIP_N; i++) edge_recip[i] = 1.0f / (float)i;
-    int q = (int)((float)n * edge_recip[d]);
-    int r = n - q * d;
-    while (r < 0) {
-        q--;
-        r += d;
-    }
-    while (r >= d) {
-        q++;
-        r -= d;
-    }
-    return q;
-}
 static inline void edge_dda_init(EdgeDDA* e, int A, int B, int w) {
     e->Ao = A;
     e->B = B;
@@ -1068,18 +1040,18 @@ static inline void edge_dda_init(EdgeDDA* e, int A, int B, int w) {
         const int n = -w + A - 1;
         e->kind = 0;
         e->A = A;
-        e->q = floordiv_r(n, A);
+        e->q = floordiv_i(n, A);
         e->r = n - e->q * A;
-        e->dq = floordiv_r(-B, A);
+        e->dq = floordiv_i(-B, A);
         e->dr = -B - e->dq * A;
     } else {
         /* x <= minx + floor(w / -A); a negative quotient means the row is empty */
         const int Ap = -A;
         e->kind = 1;
         e->A = Ap;
-        e->q = floordiv_r(w, Ap);
+        e->q = floordiv_i(w, Ap);
         e->r = w - e->q * Ap;
-        e->dq = floordiv_r(B, Ap);
+        e->dq = floordiv_i(B, Ap);
         e->dr = B - e->dq * Ap;
     }
 }
@@ -1551,11 +1523,10 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
     // for ~1200 cycles less per triangle than the reciprocal fix-ups.
     // Runtime-selectable so the replay benchmark can compare the two.
     const float inv_area_f = 65536.0f / (float)area;
-    const uint32_t inv_area32 = area < 0x20000 ? 0xFFFFFFFFu / (uint32_t)area : 0;
 #define GRAD(p0, p1, p2)                                                       \
     if (psyz_grad_float) {                                                     \
-        dx_ = div_area_16_fast((A0) * (p0) + (A1) * (p1) + (A2) * (p2), area, inv_area_f, inv_area32); \
-        dy_ = div_area_16_fast((B0) * (p0) + (B1) * (p1) + (B2) * (p2), area, inv_area_f, inv_area32); \
+        dx_ = div_area_16_fast((A0) * (p0) + (A1) * (p1) + (A2) * (p2), area, inv_area_f); \
+        dy_ = div_area_16_fast((B0) * (p0) + (B1) * (p1) + (B2) * (p2), area, inv_area_f); \
     } else {                                                                   \
         dx_ = DIV_AREA_16((s64)(A0) * (p0) + (s64)(A1) * (p1) + (s64)(A2) * (p2)); \
         dy_ = DIV_AREA_16((s64)(B0) * (p0) + (s64)(B1) * (p1) + (s64)(B2) * (p2)); \
@@ -1590,7 +1561,7 @@ SOFT_RASTER_IRAM static void raster_tri(const SV* a, const SV* b, const SV* c, i
  * wobble. */
 #define ROW0(p0, p1, p2)                                                       \
     (psyz_grad_float                                                           \
-         ? (fx)div_area_16_fast((s64)e0r * (p0) + (s64)e1r * (p1) + (s64)e2r * (p2), area, inv_area_f, inv_area32) \
+         ? (fx)div_area_16_fast((s64)e0r * (p0) + (s64)e1r * (p1) + (s64)e2r * (p2), area, inv_area_f) \
          : (fx)DIV_AREA_16((s64)e0r * (p0) + (s64)e1r * (p1) + (s64)e2r * (p2)))
 #elif defined(SOFT_RASTER_RECIP)
 #define ROW0(p0, p1, p2) ((fx)DIV_AREA_16((s64)e0r * (p0) + (s64)e1r * (p1) + (s64)e2r * (p2)))
