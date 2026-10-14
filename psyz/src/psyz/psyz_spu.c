@@ -761,38 +761,71 @@ static inline __attribute__((always_inline)) int voice_run(
     const u16 adsr_lo = vs->adsr_lo, adsr_hi = vs->adsr_hi;
     const u8 key_off = vs->key_off;
     unsigned mask = env_mask(&e, adsr_lo, adsr_hi);
-    int active = 1, i;
-    for (i = 0; i < n && active; i++) {
-        while (spos >= 0x10000) {
-            int d;
-            if (idx < lim) {
-                d = samples[idx++];
-            } else {
-                short ds;
-                vs->sample_idx = (u8)idx;
-                const int ok = voice_fetch(vs, &ds);
-                idx = vs->sample_idx;
-                lim = ADPCM_BLOCK_SAMPLES;
-                d = ds;
-                if (!ok) {
-                    g0 = g1, g1 = g2, g2 = g3, g3 = 0;
-                    active = 0;
-                    spos = 0;
-                    break;
+    int active = 1, i = 0;
+// the voice's next pitch-resampled, gauss-interpolated sample into s,
+// fetching as the pitch counter passes whole samples (at the voice's end,
+// active goes 0)
+#define VOICE_GAUSS(s)                                                         \
+    do {                                                                       \
+        while (spos >= 0x10000) {                                              \
+            int d;                                                             \
+            if (idx < lim) {                                                   \
+                d = samples[idx++];                                            \
+            } else {                                                           \
+                short ds;                                                      \
+                vs->sample_idx = (u8)idx;                                      \
+                const int ok = voice_fetch(vs, &ds);                           \
+                idx = vs->sample_idx;                                          \
+                lim = ADPCM_BLOCK_SAMPLES;                                     \
+                d = ds;                                                        \
+                if (!ok) {                                                     \
+                    g0 = g1, g1 = g2, g2 = g3, g3 = 0;                         \
+                    active = 0;                                                \
+                    spos = 0;                                                  \
+                    break;                                                     \
+                }                                                              \
+            }                                                                  \
+            g0 = g1, g1 = g2, g2 = g3, g3 = d;                                 \
+            spos -= 0x10000;                                                   \
+        }                                                                      \
+        const short* const t = &spu_gauss_tbl[(spos >> 6) & ~3];               \
+        int acc = (t[0] * g0) & ~2047;                                         \
+        acc += (t[1] * g1) & ~2047;                                            \
+        acc += (t[2] * g2) & ~2047;                                            \
+        acc += (t[3] * g3) & ~2047;                                            \
+        spos += sinc;                                                          \
+        s = clamp16(acc >> 12);                                                \
+    } while (0)
+    while (i < n && active) {
+        // a stretch where the envelope only counts: past the key-on delay,
+        // no key-off to take, and the steps until its counter fires
+        if (!e.delay && !(key_off && e.state < ADSR_RELEASE)) {
+            const unsigned k = ~e.counter & mask;
+            const int m = k < (unsigned)(n - i) ? (int)k : n - i;
+            if (m > 0) {
+                const int off = e.state == ADSR_OFF, vol = e.vol;
+                const int start = i, end = i + m;
+                for (; i < end && active; i++) {
+                    short s;
+                    VOICE_GAUSS(s);
+                    if (off) {
+                        s = 0;
+                    }
+                    if (cap) {
+                        cap[i] = s;
+                    }
+                    s = (short)(((int)s * vol) >> 15);
+                    left[i] += (s * vol_l) >> 15;
+                    right[i] += (s * vol_r) >> 15;
                 }
+                e.counter += i - start;
+                continue;
             }
-            g0 = g1, g1 = g2, g2 = g3, g3 = d;
-            spos -= 0x10000;
         }
-        const short* const t = &spu_gauss_tbl[(spos >> 6) & ~3];
-        int acc = (t[0] * g0) & ~2047;
-        acc += (t[1] * g1) & ~2047;
-        acc += (t[2] * g2) & ~2047;
-        acc += (t[3] * g3) & ~2047;
-        spos += sinc;
-        short s = clamp16(acc >> 12);
-        // env_step, with the counter mask kept until the phase or the
-        // volume changes
+        // one step with env_step's work, the counter mask kept until the
+        // phase or the volume changes
+        short s;
+        VOICE_GAUSS(s);
         if (e.delay) {
             e.delay--;
         } else {
@@ -818,7 +851,9 @@ static inline __attribute__((always_inline)) int voice_run(
         s = (short)(((int)s * e.vol) >> 15);
         left[i] += (s * vol_l) >> 15;
         right[i] += (s * vol_r) >> 15;
+        i++;
     }
+#undef VOICE_GAUSS
     vs->sample_idx = (u8)idx;
     vs->spos = spos;
     vs->gpos = 0;
