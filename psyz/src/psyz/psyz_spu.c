@@ -382,15 +382,15 @@ static inline void spu_irq_check(unsigned addr) {
     }
 }
 
-static inline __attribute__((always_inline)) int voice_decode_one_sample(VoiceState* vs) {
+// the voice's next decoded sample (0 when it stops: then returns 0)
+static inline __attribute__((always_inline)) int voice_fetch(VoiceState* vs, short* out) {
     if (vs->sample_idx >= ADPCM_BLOCK_SAMPLES) {
         // end of block, and handle loop/end flags
         if (!vs->needs_decode && (vs->block_flags & 0x01)) {
             if (!(vs->block_flags & 0x02)) {
                 vs->active = 0;
                 spu.active_mask &= ~(1u << (vs - spu.voice));
-                vs->gwin[vs->gpos] = 0;
-                vs->gpos = (vs->gpos + 1) & 3;
+                *out = 0;
                 return 0;
             }
             vs->cur_addr = vs->repeat_addr;
@@ -411,10 +411,16 @@ static inline __attribute__((always_inline)) int voice_decode_one_sample(VoiceSt
             (vs->cur_addr + ADPCM_BLOCK_BYTES) & (PSYZ_SPU_RAM_SIZE - 1);
         vs->needs_decode = 0;
     }
-    short s = vs->samples[vs->sample_idx++];
+    *out = vs->samples[vs->sample_idx++];
+    return 1;
+}
+
+static inline __attribute__((always_inline)) int voice_decode_one_sample(VoiceState* vs) {
+    short s;
+    const int ok = voice_fetch(vs, &s);
     vs->gwin[vs->gpos] = s;
     vs->gpos = (vs->gpos + 1) & 3;
-    return 1;
+    return ok;
 }
 
 static unsigned adsr_denominator(int rate) {
@@ -431,99 +437,108 @@ static int adsr_num_decrease(int rate) {
                      : (-8 + (rate & 3));
 }
 
-// process voice ADSR envelope by one sample, calculate ADSR envelope volume
-static inline __attribute__((always_inline)) void voice_envelope_step(VoiceState* vs) {
-    if (vs->delay_ticks) { // simulate PS1 SPU key on latency
-        vs->delay_ticks--;
-        return;
+// the envelope's state, for a voice's run through a block in locals
+typedef struct {
+    int vol;
+    unsigned counter;
+    AdsrState state;
+    u8 delay;
+} EnvState;
+
+// process voice ADSR envelope by one sample, calculate ADSR envelope volume;
+// 1 when the release ends (the voice stops)
+static inline __attribute__((always_inline)) int env_step(
+    EnvState* e, u16 adsr_lo, u16 adsr_hi, u8 key_off) {
+    if (e->delay) { // simulate PS1 SPU key on latency
+        e->delay--;
+        return 0;
     }
-    if (vs->key_off && vs->env_state != ADSR_OFF) {
-        vs->env_state = ADSR_RELEASE;
+    if (key_off && e->state != ADSR_OFF) {
+        e->state = ADSR_RELEASE;
     }
 
     // the PS1 SPU has an internal counter, shared across all states, that
     // allows to trigger a change based on the selected ADSR rate
-    unsigned ctr = ++vs->env_counter;
+    unsigned ctr = ++e->counter;
 /* the denominator is a power of two: a mask, not a divide per voice per sample */
 #define ADSR_FIRES(rate) ((ctr & (adsr_denominator(rate) - 1)) == 0)
 
-    switch (vs->env_state) {
+    switch (e->state) {
     case ADSR_ATTACK: {
-        int attack_rate = (vs->adsr_lo >> 8) & 0x7F;
-        int attack_exp = (vs->adsr_lo >> 15) & 1;
+        int attack_rate = (adsr_lo >> 8) & 0x7F;
+        int attack_exp = (adsr_lo >> 15) & 1;
         int rate = attack_rate;
-        if (attack_exp && vs->env_vol >= 0x6000) {
+        if (attack_exp && e->vol >= 0x6000) {
             rate += 8;
         }
         if (ADSR_FIRES(rate)) {
-            vs->env_vol += adsr_num_increase(rate);
-            if (vs->env_vol >= 0x7FFF) {
-                vs->env_vol = 0x7FFF;
-                vs->env_state = ADSR_DECAY;
+            e->vol += adsr_num_increase(rate);
+            if (e->vol >= 0x7FFF) {
+                e->vol = 0x7FFF;
+                e->state = ADSR_DECAY;
             }
         }
         break;
     }
     case ADSR_DECAY: {
-        int decay_rate = (vs->adsr_lo >> 4) & 0x0F;
+        int decay_rate = (adsr_lo >> 4) & 0x0F;
         int rate = decay_rate * 4; // decay is always exponential decrease
         if (ADSR_FIRES(rate)) {
-            vs->env_vol += (adsr_num_decrease(rate) * vs->env_vol) >> 15;
-            if (vs->env_vol < 0) {
-                vs->env_vol = 0;
+            e->vol += (adsr_num_decrease(rate) * e->vol) >> 15;
+            if (e->vol < 0) {
+                e->vol = 0;
             }
-            int sustain_level = vs->adsr_lo & 0x0F;
-            if (((vs->env_vol >> 11) & 0xF) <= sustain_level) {
-                vs->env_state = ADSR_SUSTAIN;
+            int sustain_level = adsr_lo & 0x0F;
+            if (((e->vol >> 11) & 0xF) <= sustain_level) {
+                e->state = ADSR_SUSTAIN;
             }
         }
         break;
     }
     case ADSR_SUSTAIN: {
-        int sustain_rate = (vs->adsr_hi >> 6) & 0x7F;
-        int sustain_dec = (vs->adsr_hi >> 14) & 1;
-        int sustain_exp = (vs->adsr_hi >> 15) & 1;
+        int sustain_rate = (adsr_hi >> 6) & 0x7F;
+        int sustain_dec = (adsr_hi >> 14) & 1;
+        int sustain_exp = (adsr_hi >> 15) & 1;
         int rate = sustain_rate;
         if (!sustain_dec) {
-            if (sustain_exp && vs->env_vol >= 0x6000) {
+            if (sustain_exp && e->vol >= 0x6000) {
                 rate += 8;
             }
             if (ADSR_FIRES(rate)) {
-                vs->env_vol += adsr_num_increase(rate);
-                if (vs->env_vol > 0x7FFF) {
-                    vs->env_vol = 0x7FFF;
+                e->vol += adsr_num_increase(rate);
+                if (e->vol > 0x7FFF) {
+                    e->vol = 0x7FFF;
                 }
             }
         } else {
             if (ADSR_FIRES(rate)) {
                 if (sustain_exp) {
-                    vs->env_vol +=
-                        (adsr_num_decrease(rate) * vs->env_vol) >> 15;
+                    e->vol +=
+                        (adsr_num_decrease(rate) * e->vol) >> 15;
                 } else {
-                    vs->env_vol += adsr_num_decrease(rate);
+                    e->vol += adsr_num_decrease(rate);
                 }
-                if (vs->env_vol < 0) {
-                    vs->env_vol = 0;
+                if (e->vol < 0) {
+                    e->vol = 0;
                 }
             }
         }
         break;
     }
     case ADSR_RELEASE: {
-        int release_rate = vs->adsr_hi & 0x1F;
+        int release_rate = adsr_hi & 0x1F;
         int rate = release_rate * 4;
         if (ADSR_FIRES(rate)) {
-            int release_exp = (vs->adsr_hi >> 5) & 1;
+            int release_exp = (adsr_hi >> 5) & 1;
             if (release_exp) {
-                vs->env_vol += (adsr_num_decrease(rate) * vs->env_vol) >> 15;
+                e->vol += (adsr_num_decrease(rate) * e->vol) >> 15;
             } else {
-                vs->env_vol += adsr_num_decrease(rate);
+                e->vol += adsr_num_decrease(rate);
             }
-            if (vs->env_vol <= 0) {
-                vs->env_vol = 0;
-                vs->env_state = ADSR_OFF;
-                vs->active = 0;
-                spu.active_mask &= ~(1u << (vs - spu.voice));
+            if (e->vol <= 0) {
+                e->vol = 0;
+                e->state = ADSR_OFF;
+                return 1;
             }
         }
         break;
@@ -532,7 +547,22 @@ static inline __attribute__((always_inline)) void voice_envelope_step(VoiceState
         break;
     }
 #undef ADSR_FIRES
+    return 0;
 }
+
+static inline __attribute__((always_inline)) void voice_envelope_step(VoiceState* vs) {
+    EnvState e = {vs->env_vol, vs->env_counter, vs->env_state, vs->delay_ticks};
+    const int off = env_step(&e, vs->adsr_lo, vs->adsr_hi, vs->key_off);
+    vs->env_vol = e.vol;
+    vs->env_counter = e.counter;
+    vs->env_state = e.state;
+    vs->delay_ticks = e.delay;
+    if (off) {
+        vs->active = 0;
+        spu.active_mask &= ~(1u << (vs - spu.voice));
+    }
+}
+
 
 // Advance voice `v` by one output-rate tick (44.1 kHz) and return its
 // pitch-resampled, gauss-interpolated short sample.
@@ -680,6 +710,68 @@ volatile int psyz_pending_rcnt;
  * the same integers in another order: the output is spu_tick's. (One
  * difference: a voice reading the capture area sees the block's captures
  * only after the block; nothing plays from there.) */
+/* one voice through the block: voice_step + voice_envelope_step + the mix
+ * of spu_block's loop, with the voice's state in locals */
+static inline __attribute__((always_inline)) int voice_run(
+    int v, int n, int* left, int* right, short* cap, int vol_l, int vol_r) {
+    VoiceState* vs = &spu.voice[v];
+    const unsigned pitch = _spu_RXX->rxx.voice[v].pitch & 0x3FFF;
+    const unsigned sinc = pitch ? pitch << 4 : 1;
+    vs->sinc = sinc;
+    unsigned spos = vs->spos, gpos = vs->gpos;
+    short gw[4] = {vs->gwin[0], vs->gwin[1], vs->gwin[2], vs->gwin[3]};
+    EnvState e = {vs->env_vol, vs->env_counter, vs->env_state, vs->delay_ticks};
+    const u16 adsr_lo = vs->adsr_lo, adsr_hi = vs->adsr_hi;
+    const u8 key_off = vs->key_off;
+    int active = 1, i;
+    for (i = 0; i < n && active; i++) {
+        while (spos >= 0x10000) {
+            short d;
+            const int ok = voice_fetch(vs, &d);
+            gw[gpos] = d;
+            gpos = (gpos + 1) & 3;
+            if (!ok) {
+                active = 0;
+                spos = 0;
+                break;
+            }
+            spos -= 0x10000;
+        }
+        const int vl = (spos >> 6) & ~3;
+        int acc = (spu_gauss_tbl[vl + 0] * gw[gpos & 3]) & ~2047;
+        acc += (spu_gauss_tbl[vl + 1] * gw[(gpos + 1) & 3]) & ~2047;
+        acc += (spu_gauss_tbl[vl + 2] * gw[(gpos + 2) & 3]) & ~2047;
+        acc += (spu_gauss_tbl[vl + 3] * gw[(gpos + 3) & 3]) & ~2047;
+        spos += sinc;
+        short s = clamp16(acc >> 12);
+        if (env_step(&e, adsr_lo, adsr_hi, key_off)) {
+            active = 0;
+            vs->active = 0;
+            spu.active_mask &= ~(1u << v);
+        }
+        if (e.state == ADSR_OFF) {
+            s = 0;
+        }
+        if (cap) {
+            cap[i] = s;
+        }
+        s = (short)(((int)s * e.vol) >> 15);
+        left[i] += (s * vol_l) >> 15;
+        right[i] += (s * vol_r) >> 15;
+    }
+    vs->spos = spos;
+    vs->gpos = (u8)gpos;
+    vs->gwin[0] = gw[0];
+    vs->gwin[1] = gw[1];
+    vs->gwin[2] = gw[2];
+    vs->gwin[3] = gw[3];
+    vs->env_vol = e.vol;
+    vs->env_counter = e.counter;
+    vs->env_state = e.state;
+    vs->delay_ticks = e.delay;
+    return i;
+}
+
 #define SPU_BLOCK 128
 static void spu_block(short* out, int n) {
     SPU_RXX* rxx = (SPU_RXX*)&_spu_RXX->rxx;
@@ -698,20 +790,7 @@ static void spu_block(short* out, int n) {
         const int vol_l = voice_vol(rxx->voice[v].volume.left);
         const int vol_r = voice_vol(rxx->voice[v].volume.right);
         short* const cap = v == 1 ? cap1 : v == 3 ? cap3 : NULL;
-        int i;
-        for (i = 0; i < n && vs->active; i++) {
-            short s = voice_step(v);
-            voice_envelope_step(vs);
-            if (vs->env_state == ADSR_OFF) {
-                s = 0;
-            }
-            if (cap) {
-                cap[i] = s;
-            }
-            s = (short)(((int)s * vs->env_vol) >> 15);
-            left[i] += (s * vol_l) >> 15;
-            right[i] += (s * vol_r) >> 15;
-        }
+        const int i = voice_run(v, n, left, right, cap, vol_l, vol_r);
         if (i > 0) {
             rxx->voice[v].volumex = (unsigned short)vs->env_vol;
         }
