@@ -164,7 +164,11 @@ static inline void tex_dirty_all(void) {
 }
 void Draw_TiledInit(void) {
     if (!vram_tiled) {
+#ifdef ESP_PLATFORM
         vram_tiled = heap_caps_malloc((size_t)VRAM_W * VRAM_H * sizeof(u16), MALLOC_CAP_SPIRAM);
+#else
+        vram_tiled = malloc((size_t)VRAM_W * VRAM_H * sizeof(u16));
+#endif
         if (!vram_tiled) {
             printf("[soft] no PSRAM for the tiled texture shadow\n");
             abort();
