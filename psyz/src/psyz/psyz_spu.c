@@ -765,7 +765,7 @@ static inline __attribute__((always_inline)) int voice_run(
 // the voice's next pitch-resampled, gauss-interpolated sample into s,
 // fetching as the pitch counter passes whole samples (at the voice's end,
 // active goes 0)
-#define VOICE_GAUSS(s)                                                         \
+#define VOICE_ADVANCE()                                                        \
     do {                                                                       \
         while (spos >= 0x10000) {                                              \
             int d;                                                             \
@@ -788,6 +788,10 @@ static inline __attribute__((always_inline)) int voice_run(
             g0 = g1, g1 = g2, g2 = g3, g3 = d;                                 \
             spos -= 0x10000;                                                   \
         }                                                                      \
+    } while (0)
+#define VOICE_GAUSS(s)                                                         \
+    do {                                                                       \
+        VOICE_ADVANCE();                                                       \
         const short* const t = &spu_gauss_tbl[(spos >> 6) & ~3];               \
         int acc = (t[0] * g0) & ~2047;                                         \
         acc += (t[1] * g1) & ~2047;                                            \
@@ -805,6 +809,16 @@ static inline __attribute__((always_inline)) int voice_run(
             if (m > 0) {
                 const int off = e.state == ADSR_OFF, vol = e.vol;
                 const int start = i, end = i + m;
+                if ((off || !vol || (!vol_l && !vol_r)) && !cap) {
+                    // silent (a released voice still playing, about a
+                    // third of the voices' samples): it only moves on
+                    for (; i < end && active; i++) {
+                        VOICE_ADVANCE();
+                        spos += sinc;
+                    }
+                    e.counter += i - start;
+                    continue;
+                }
                 for (; i < end && active; i++) {
                     short s;
                     VOICE_GAUSS(s);
@@ -854,6 +868,7 @@ static inline __attribute__((always_inline)) int voice_run(
         i++;
     }
 #undef VOICE_GAUSS
+#undef VOICE_ADVANCE
     vs->sample_idx = (u8)idx;
     vs->spos = spos;
     vs->gpos = 0;
