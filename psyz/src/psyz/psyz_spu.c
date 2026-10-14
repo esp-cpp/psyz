@@ -400,10 +400,14 @@ static inline __attribute__((always_inline)) int voice_fetch(VoiceState* vs, sho
     }
     if (vs->needs_decode) {
         unsigned char block[ADPCM_BLOCK_BYTES];
+        const unsigned char* src = &spu.ram[vs->cur_addr];
         spu_irq_check(vs->cur_addr);
-        Psyz_SpuMemRead(vs->cur_addr, block, ADPCM_BLOCK_BYTES);
+        if (vs->cur_addr > PSYZ_SPU_RAM_SIZE - ADPCM_BLOCK_BYTES) {
+            Psyz_SpuMemRead(vs->cur_addr, block, ADPCM_BLOCK_BYTES);
+            src = block;
+        }
         spu_adpcm_decode_block(
-            block, &vs->hist1, &vs->hist2, vs->samples, &vs->block_flags);
+            src, &vs->hist1, &vs->hist2, vs->samples, &vs->block_flags);
         if (vs->block_flags & 0x04) {
             vs->repeat_addr = vs->cur_addr;
         }
@@ -445,6 +449,110 @@ typedef struct {
     u8 delay;
 } EnvState;
 
+// the envelope's counter mask in its current phase: it changes when the
+// counter & mask is 0. It depends only on the phase and (attack, sustain
+// increase) on the volume crossing 0x6000, so it is recomputed only when one
+// of those changes.
+static inline __attribute__((always_inline)) unsigned env_mask(
+    const EnvState* e, u16 adsr_lo, u16 adsr_hi) {
+    int rate;
+    switch (e->state) {
+    case ADSR_ATTACK:
+        rate = (adsr_lo >> 8) & 0x7F;
+        if (((adsr_lo >> 15) & 1) && e->vol >= 0x6000) {
+            rate += 8;
+        }
+        break;
+    case ADSR_DECAY:
+        rate = ((adsr_lo >> 4) & 0x0F) * 4; // decay is always exponential decrease
+        break;
+    case ADSR_SUSTAIN:
+        rate = (adsr_hi >> 6) & 0x7F;
+        if (!((adsr_hi >> 14) & 1) && ((adsr_hi >> 15) & 1) && e->vol >= 0x6000) {
+            rate += 8;
+        }
+        break;
+    case ADSR_RELEASE:
+        rate = (adsr_hi & 0x1F) * 4;
+        break;
+    default:
+        return ~0u; // off: nothing changes (the counter wrapping fires nothing)
+    }
+    return adsr_denominator(rate) - 1;
+}
+
+// the envelope's change when its counter fires; 1 when the release ends
+static inline __attribute__((always_inline)) int env_fire(
+    EnvState* e, u16 adsr_lo, u16 adsr_hi) {
+    switch (e->state) {
+    case ADSR_ATTACK: {
+        int rate = (adsr_lo >> 8) & 0x7F;
+        if (((adsr_lo >> 15) & 1) && e->vol >= 0x6000) {
+            rate += 8;
+        }
+        e->vol += adsr_num_increase(rate);
+        if (e->vol >= 0x7FFF) {
+            e->vol = 0x7FFF;
+            e->state = ADSR_DECAY;
+        }
+        break;
+    }
+    case ADSR_DECAY: {
+        int rate = ((adsr_lo >> 4) & 0x0F) * 4;
+        e->vol += (adsr_num_decrease(rate) * e->vol) >> 15;
+        if (e->vol < 0) {
+            e->vol = 0;
+        }
+        int sustain_level = adsr_lo & 0x0F;
+        if (((e->vol >> 11) & 0xF) <= sustain_level) {
+            e->state = ADSR_SUSTAIN;
+        }
+        break;
+    }
+    case ADSR_SUSTAIN: {
+        int rate = (adsr_hi >> 6) & 0x7F;
+        int sustain_dec = (adsr_hi >> 14) & 1;
+        int sustain_exp = (adsr_hi >> 15) & 1;
+        if (!sustain_dec) {
+            if (sustain_exp && e->vol >= 0x6000) {
+                rate += 8;
+            }
+            e->vol += adsr_num_increase(rate);
+            if (e->vol > 0x7FFF) {
+                e->vol = 0x7FFF;
+            }
+        } else {
+            if (sustain_exp) {
+                e->vol += (adsr_num_decrease(rate) * e->vol) >> 15;
+            } else {
+                e->vol += adsr_num_decrease(rate);
+            }
+            if (e->vol < 0) {
+                e->vol = 0;
+            }
+        }
+        break;
+    }
+    case ADSR_RELEASE: {
+        int rate = (adsr_hi & 0x1F) * 4;
+        if ((adsr_hi >> 5) & 1) {
+            e->vol += (adsr_num_decrease(rate) * e->vol) >> 15;
+        } else {
+            e->vol += adsr_num_decrease(rate);
+        }
+        if (e->vol <= 0) {
+            e->vol = 0;
+            e->state = ADSR_OFF;
+            return 1;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    return 0;
+}
+
 // process voice ADSR envelope by one sample, calculate ADSR envelope volume;
 // 1 when the release ends (the voice stops)
 static inline __attribute__((always_inline)) int env_step(
@@ -459,94 +567,10 @@ static inline __attribute__((always_inline)) int env_step(
 
     // the PS1 SPU has an internal counter, shared across all states, that
     // allows to trigger a change based on the selected ADSR rate
-    unsigned ctr = ++e->counter;
-/* the denominator is a power of two: a mask, not a divide per voice per sample */
-#define ADSR_FIRES(rate) ((ctr & (adsr_denominator(rate) - 1)) == 0)
-
-    switch (e->state) {
-    case ADSR_ATTACK: {
-        int attack_rate = (adsr_lo >> 8) & 0x7F;
-        int attack_exp = (adsr_lo >> 15) & 1;
-        int rate = attack_rate;
-        if (attack_exp && e->vol >= 0x6000) {
-            rate += 8;
-        }
-        if (ADSR_FIRES(rate)) {
-            e->vol += adsr_num_increase(rate);
-            if (e->vol >= 0x7FFF) {
-                e->vol = 0x7FFF;
-                e->state = ADSR_DECAY;
-            }
-        }
-        break;
+    // (the denominator is a power of two: a mask, not a divide)
+    if ((++e->counter & env_mask(e, adsr_lo, adsr_hi)) == 0) {
+        return env_fire(e, adsr_lo, adsr_hi);
     }
-    case ADSR_DECAY: {
-        int decay_rate = (adsr_lo >> 4) & 0x0F;
-        int rate = decay_rate * 4; // decay is always exponential decrease
-        if (ADSR_FIRES(rate)) {
-            e->vol += (adsr_num_decrease(rate) * e->vol) >> 15;
-            if (e->vol < 0) {
-                e->vol = 0;
-            }
-            int sustain_level = adsr_lo & 0x0F;
-            if (((e->vol >> 11) & 0xF) <= sustain_level) {
-                e->state = ADSR_SUSTAIN;
-            }
-        }
-        break;
-    }
-    case ADSR_SUSTAIN: {
-        int sustain_rate = (adsr_hi >> 6) & 0x7F;
-        int sustain_dec = (adsr_hi >> 14) & 1;
-        int sustain_exp = (adsr_hi >> 15) & 1;
-        int rate = sustain_rate;
-        if (!sustain_dec) {
-            if (sustain_exp && e->vol >= 0x6000) {
-                rate += 8;
-            }
-            if (ADSR_FIRES(rate)) {
-                e->vol += adsr_num_increase(rate);
-                if (e->vol > 0x7FFF) {
-                    e->vol = 0x7FFF;
-                }
-            }
-        } else {
-            if (ADSR_FIRES(rate)) {
-                if (sustain_exp) {
-                    e->vol +=
-                        (adsr_num_decrease(rate) * e->vol) >> 15;
-                } else {
-                    e->vol += adsr_num_decrease(rate);
-                }
-                if (e->vol < 0) {
-                    e->vol = 0;
-                }
-            }
-        }
-        break;
-    }
-    case ADSR_RELEASE: {
-        int release_rate = adsr_hi & 0x1F;
-        int rate = release_rate * 4;
-        if (ADSR_FIRES(rate)) {
-            int release_exp = (adsr_hi >> 5) & 1;
-            if (release_exp) {
-                e->vol += (adsr_num_decrease(rate) * e->vol) >> 15;
-            } else {
-                e->vol += adsr_num_decrease(rate);
-            }
-            if (e->vol <= 0) {
-                e->vol = 0;
-                e->state = ADSR_OFF;
-                return 1;
-            }
-        }
-        break;
-    }
-    default:
-        break;
-    }
-#undef ADSR_FIRES
     return 0;
 }
 
@@ -718,36 +742,67 @@ static inline __attribute__((always_inline)) int voice_run(
     const unsigned pitch = _spu_RXX->rxx.voice[v].pitch & 0x3FFF;
     const unsigned sinc = pitch ? pitch << 4 : 1;
     vs->sinc = sinc;
-    unsigned spos = vs->spos, gpos = vs->gpos;
-    short gw[4] = {vs->gwin[0], vs->gwin[1], vs->gwin[2], vs->gwin[3]};
+    unsigned spos = vs->spos;
+    // the gauss window oldest to newest, in registers: no ring index
+    const unsigned gpos = vs->gpos;
+    int g0 = vs->gwin[gpos & 3], g1 = vs->gwin[(gpos + 1) & 3];
+    int g2 = vs->gwin[(gpos + 2) & 3], g3 = vs->gwin[(gpos + 3) & 3];
+    // the decoded block's samples are read here until it runs out; then
+    // voice_fetch (block ends, loops, decoding) takes over
+    const short* const samples = vs->samples;
+    unsigned idx = vs->sample_idx;
+    unsigned lim = vs->needs_decode ? 0 : ADPCM_BLOCK_SAMPLES;
     EnvState e = {vs->env_vol, vs->env_counter, vs->env_state, vs->delay_ticks};
     const u16 adsr_lo = vs->adsr_lo, adsr_hi = vs->adsr_hi;
     const u8 key_off = vs->key_off;
+    unsigned mask = env_mask(&e, adsr_lo, adsr_hi);
     int active = 1, i;
     for (i = 0; i < n && active; i++) {
         while (spos >= 0x10000) {
-            short d;
-            const int ok = voice_fetch(vs, &d);
-            gw[gpos] = d;
-            gpos = (gpos + 1) & 3;
-            if (!ok) {
-                active = 0;
-                spos = 0;
-                break;
+            int d;
+            if (idx < lim) {
+                d = samples[idx++];
+            } else {
+                short ds;
+                vs->sample_idx = (u8)idx;
+                const int ok = voice_fetch(vs, &ds);
+                idx = vs->sample_idx;
+                lim = ADPCM_BLOCK_SAMPLES;
+                d = ds;
+                if (!ok) {
+                    g0 = g1, g1 = g2, g2 = g3, g3 = 0;
+                    active = 0;
+                    spos = 0;
+                    break;
+                }
             }
+            g0 = g1, g1 = g2, g2 = g3, g3 = d;
             spos -= 0x10000;
         }
-        const int vl = (spos >> 6) & ~3;
-        int acc = (spu_gauss_tbl[vl + 0] * gw[gpos & 3]) & ~2047;
-        acc += (spu_gauss_tbl[vl + 1] * gw[(gpos + 1) & 3]) & ~2047;
-        acc += (spu_gauss_tbl[vl + 2] * gw[(gpos + 2) & 3]) & ~2047;
-        acc += (spu_gauss_tbl[vl + 3] * gw[(gpos + 3) & 3]) & ~2047;
+        const short* const t = &spu_gauss_tbl[(spos >> 6) & ~3];
+        int acc = (t[0] * g0) & ~2047;
+        acc += (t[1] * g1) & ~2047;
+        acc += (t[2] * g2) & ~2047;
+        acc += (t[3] * g3) & ~2047;
         spos += sinc;
         short s = clamp16(acc >> 12);
-        if (env_step(&e, adsr_lo, adsr_hi, key_off)) {
-            active = 0;
-            vs->active = 0;
-            spu.active_mask &= ~(1u << v);
+        // env_step, with the counter mask kept until the phase or the
+        // volume changes
+        if (e.delay) {
+            e.delay--;
+        } else {
+            if (key_off && e.state < ADSR_RELEASE) {
+                e.state = ADSR_RELEASE;
+                mask = env_mask(&e, adsr_lo, adsr_hi);
+            }
+            if ((++e.counter & mask) == 0) {
+                if (env_fire(&e, adsr_lo, adsr_hi)) {
+                    active = 0;
+                    vs->active = 0;
+                    spu.active_mask &= ~(1u << v);
+                }
+                mask = env_mask(&e, adsr_lo, adsr_hi);
+            }
         }
         if (e.state == ADSR_OFF) {
             s = 0;
@@ -759,12 +814,13 @@ static inline __attribute__((always_inline)) int voice_run(
         left[i] += (s * vol_l) >> 15;
         right[i] += (s * vol_r) >> 15;
     }
+    vs->sample_idx = (u8)idx;
     vs->spos = spos;
-    vs->gpos = (u8)gpos;
-    vs->gwin[0] = gw[0];
-    vs->gwin[1] = gw[1];
-    vs->gwin[2] = gw[2];
-    vs->gwin[3] = gw[3];
+    vs->gpos = 0;
+    vs->gwin[0] = (short)g0;
+    vs->gwin[1] = (short)g1;
+    vs->gwin[2] = (short)g2;
+    vs->gwin[3] = (short)g3;
     vs->env_vol = e.vol;
     vs->env_counter = e.counter;
     vs->env_state = e.state;
