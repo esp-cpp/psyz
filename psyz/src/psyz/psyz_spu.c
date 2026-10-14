@@ -382,7 +382,7 @@ static inline void spu_irq_check(unsigned addr) {
     }
 }
 
-static int voice_decode_one_sample(VoiceState* vs) {
+static inline __attribute__((always_inline)) int voice_decode_one_sample(VoiceState* vs) {
     if (vs->sample_idx >= ADPCM_BLOCK_SAMPLES) {
         // end of block, and handle loop/end flags
         if (!vs->needs_decode && (vs->block_flags & 0x01)) {
@@ -432,7 +432,7 @@ static int adsr_num_decrease(int rate) {
 }
 
 // process voice ADSR envelope by one sample, calculate ADSR envelope volume
-static void voice_envelope_step(VoiceState* vs) {
+static inline __attribute__((always_inline)) void voice_envelope_step(VoiceState* vs) {
     if (vs->delay_ticks) { // simulate PS1 SPU key on latency
         vs->delay_ticks--;
         return;
@@ -536,7 +536,7 @@ static void voice_envelope_step(VoiceState* vs) {
 
 // Advance voice `v` by one output-rate tick (44.1 kHz) and return its
 // pitch-resampled, gauss-interpolated short sample.
-static short voice_step(int v) {
+static inline __attribute__((always_inline)) short voice_step(int v) {
     VoiceState* vs = &spu.voice[v];
 
     // for pitch changes during voice on, enable vibrato or bends
@@ -673,6 +673,94 @@ static void spu_tick(short* out) {
 volatile int psyz_pending_rcnt;
 #endif
 
+/* spu_tick's frames, a block at a time and a voice at a time: within one pull
+ * no register changes (the platform pulls up to the time of each register
+ * write before making it), so each voice runs through the block with its
+ * pitch and volumes read once, and the frames are mixed after. The sums are
+ * the same integers in another order: the output is spu_tick's. (One
+ * difference: a voice reading the capture area sees the block's captures
+ * only after the block; nothing plays from there.) */
+#define SPU_BLOCK 128
+static void spu_block(short* out, int n) {
+    SPU_RXX* rxx = (SPU_RXX*)&_spu_RXX->rxx;
+    int left[SPU_BLOCK], right[SPU_BLOCK];
+    short cap1[SPU_BLOCK], cap3[SPU_BLOCK];
+    memset(left, 0, sizeof(int) * n);
+    memset(right, 0, sizeof(int) * n);
+    memset(cap1, 0, sizeof(short) * n);
+    memset(cap3, 0, sizeof(short) * n);
+    unsigned active_last = 0;
+    for (unsigned m = spu.active_mask; m; m &= m - 1) {
+        const int v = __builtin_ctz(m);
+        VoiceState* vs = &spu.voice[v];
+        if (!vs->active)
+            continue;
+        const int vol_l = voice_vol(rxx->voice[v].volume.left);
+        const int vol_r = voice_vol(rxx->voice[v].volume.right);
+        short* const cap = v == 1 ? cap1 : v == 3 ? cap3 : NULL;
+        int i;
+        for (i = 0; i < n && vs->active; i++) {
+            short s = voice_step(v);
+            voice_envelope_step(vs);
+            if (vs->env_state == ADSR_OFF) {
+                s = 0;
+            }
+            if (cap) {
+                cap[i] = s;
+            }
+            s = (short)(((int)s * vs->env_vol) >> 15);
+            left[i] += (s * vol_l) >> 15;
+            right[i] += (s * vol_r) >> 15;
+        }
+        if (i > 0) {
+            rxx->voice[v].volumex = (unsigned short)vs->env_vol;
+        }
+        active_last += i == n;
+    }
+    psyz_spu_voices_active = active_last;
+
+    const unsigned short spucnt = rxx->spucnt;
+    const int mute = !(spucnt & SPU_CTRL_MASK_MUTE_SPU);
+    const int cd_on = (spucnt & SPU_CTRL_MASK_CD_AUDIO_ENABLE) != 0;
+    const int main_l = clamp15(rxx->main_vol.left), main_r = clamp15(rxx->main_vol.right);
+    for (int i = 0; i < n; i++) {
+        if (spu.cd_ring_count < CD_RING_LOW_WATER) {
+            size_t space = CD_RING_FRAMES - spu.cd_ring_count;
+            size_t write_pos = (spu.cd_ring_read + spu.cd_ring_count) & CD_RING_MASK;
+            size_t chunk = CD_RING_FRAMES - write_pos;
+            if (chunk > space)
+                chunk = space;
+            size_t got = Psyz_CdPullSamples(&spu.cd_ring[write_pos * 2], chunk);
+            spu.cd_ring_count += got;
+        }
+        int cd_left = 0, cd_right = 0;
+        if (spu.cd_ring_count > 0) {
+            cd_left = spu.cd_ring[spu.cd_ring_read * 2];
+            cd_right = spu.cd_ring[spu.cd_ring_read * 2 + 1];
+            spu.cd_ring_read = (spu.cd_ring_read + 1) & CD_RING_MASK;
+            spu.cd_ring_count--;
+        }
+        int left_sum = mute ? 0 : left[i], right_sum = mute ? 0 : right[i];
+        if (cd_on) {
+            left_sum += (cd_left * rxx->cd_vol.left) >> 15;
+            right_sum += (cd_right * rxx->cd_vol.right) >> 15;
+        }
+        out[i * 2] = clamp16((left_sum * main_l) >> 14);
+        out[i * 2 + 1] = clamp16((right_sum * main_r) >> 14);
+        write_capture(0, (short)cd_left);
+        write_capture(1, (short)cd_right);
+        write_capture(2, cap1[i]);
+        write_capture(3, cap3[i]);
+        unsigned prev_pos = spu.capture_pos;
+        spu.capture_pos = (prev_pos + 2) & 0x3FF;
+        if ((prev_pos ^ spu.capture_pos) & 0x200) {
+            rxx->spustat ^= 1u << 11;
+        }
+    }
+}
+
+int psyz_spu_by_voice = 1; /* 0: spu_tick per frame (the reference) */
+
 void Psyz_SpuPullSamples(short* out, int num_frames) {
     if (!spu.initialized) {
         memset(out, 0, num_frames * 2 * sizeof(short));
@@ -683,6 +771,13 @@ void Psyz_SpuPullSamples(short* out, int num_frames) {
 #else
     Psyz_RcntAdd(num_frames);
 #endif
+    if (psyz_spu_by_voice) {
+        for (int i = 0; i < num_frames; i += SPU_BLOCK) {
+            const int n = num_frames - i < SPU_BLOCK ? num_frames - i : SPU_BLOCK;
+            spu_block(&out[i * 2], n);
+        }
+        return;
+    }
     for (int i = 0; i < num_frames; i++) {
         spu_tick(&out[i * 2]);
     }
