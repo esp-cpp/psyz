@@ -467,6 +467,11 @@ static inline __attribute__((always_inline)) unsigned env_mask(
         rate = ((adsr_lo >> 4) & 0x0F) * 4; // decay is always exponential decrease
         break;
     case ADSR_SUSTAIN:
+        // held at the top (increase) or at 0 (decrease) firing changes
+        // nothing: the commonest case, often at a rate firing every sample
+        if (!((adsr_hi >> 14) & 1) ? e->vol == 0x7FFF : e->vol == 0) {
+            return ~0u;
+        }
         rate = (adsr_hi >> 6) & 0x7F;
         if (!((adsr_hi >> 14) & 1) && ((adsr_hi >> 15) & 1) && e->vol >= 0x6000) {
             rate += 8;
