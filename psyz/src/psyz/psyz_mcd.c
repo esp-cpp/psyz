@@ -281,3 +281,125 @@ int Mcd_NameMatch(const char* pattern, const char* name) {
     }
     return 1;
 }
+
+/* ---- the BIOS's "buXX:" device ---- */
+#define DEV_FDS 4
+#define DEV_FD0 0x4D430000 /* 'MC': far from any FILE* cast to int */
+static char dev_path[2][256];
+static struct {
+    int used, port;
+    char name[MCD_NAME + 1];
+    uint32_t pos, size;
+} dev_fd[DEV_FDS];
+static struct {
+    int port, next, n;
+    char pattern[MCD_NAME + 1];
+    McdEntry all[MCD_FILES];
+} dev_dir;
+
+void Mcd_SetPath(int port, const char* path) {
+    if (port < 0 || port > 1) return;
+    snprintf(dev_path[port], sizeof dev_path[port], "%s", path ? path : "");
+}
+const char* Mcd_GetPath(int port) {
+    return port >= 0 && port <= 1 && dev_path[port][0] ? dev_path[port] : NULL;
+}
+int Mcd_DevState(int port) {
+    const char* p = Mcd_GetPath(port);
+    return p ? Mcd_Check(p, 1) : MCD_ERR_IO;
+}
+int Mcd_DevPort(const char* name) {
+    if (!name || name[0] != 'b' || name[1] != 'u' || name[3] != '0' || name[4] != ':') return -1;
+    return name[2] == '0' ? 0 : name[2] == '1' ? 1 : -1;
+}
+static void dev_file_name(const char* name, char out[MCD_NAME + 1]) {
+    snprintf(out, MCD_NAME + 1, "%s", name + 5);
+}
+
+int Mcd_DevOpen(const char* name, int flags) {
+    const int port = Mcd_DevPort(name);
+    const char* path = Mcd_GetPath(port);
+    if (!path || Mcd_Check(path, 1) != MCD_OK) return -1;
+    char fname[MCD_NAME + 1];
+    dev_file_name(name, fname);
+    if (flags & MCD_DEV_FCREAT) {
+        const int blocks = (flags >> 16) & 0xFFFF;
+        if (Mcd_Create(path, fname, blocks ? blocks : 1) != MCD_OK) return -1;
+    }
+    McdEntry e;
+    if (Mcd_Find(path, fname, &e) != MCD_OK) return -1;
+    for (int i = 0; i < DEV_FDS; i++) {
+        if (dev_fd[i].used) continue;
+        dev_fd[i].used = 1;
+        dev_fd[i].port = port;
+        memcpy(dev_fd[i].name, fname, sizeof fname);
+        dev_fd[i].pos = 0;
+        dev_fd[i].size = e.size;
+        return DEV_FD0 + i;
+    }
+    return -1;
+}
+int Mcd_DevIsFd(int fd) { return fd >= DEV_FD0 && fd < DEV_FD0 + DEV_FDS && dev_fd[fd - DEV_FD0].used; }
+static long dev_io(int fd, void* buf, long n, int write) {
+    if (!Mcd_DevIsFd(fd) || n < 0) return -1;
+    const int i = fd - DEV_FD0;
+    const char* path = Mcd_GetPath(dev_fd[i].port);
+    if (!path) return -1;
+    if (dev_fd[i].pos >= dev_fd[i].size) return 0;
+    if ((uint32_t)n > dev_fd[i].size - dev_fd[i].pos) n = (long)(dev_fd[i].size - dev_fd[i].pos);
+    const int r = write ? Mcd_Write(path, dev_fd[i].name, dev_fd[i].pos, buf, (uint32_t)n)
+                        : Mcd_Read(path, dev_fd[i].name, dev_fd[i].pos, buf, (uint32_t)n);
+    if (r != MCD_OK) return -1;
+    dev_fd[i].pos += (uint32_t)n;
+    return n;
+}
+long Mcd_DevRead(int fd, void* buf, long n) { return dev_io(fd, buf, n, 0); }
+long Mcd_DevWrite(int fd, const void* buf, long n) { return dev_io(fd, (void*)buf, n, 1); }
+long Mcd_DevSeek(int fd, long offset, int whence) {
+    if (!Mcd_DevIsFd(fd)) return -1;
+    const int i = fd - DEV_FD0;
+    long at = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (long)dev_fd[i].pos : (long)dev_fd[i].size;
+    at += offset;
+    if (at < 0 || at > (long)dev_fd[i].size) return -1;
+    dev_fd[i].pos = (uint32_t)at;
+    return at;
+}
+int Mcd_DevClose(int fd) {
+    if (!Mcd_DevIsFd(fd)) return -1;
+    dev_fd[fd - DEV_FD0].used = 0;
+    return fd;
+}
+
+int Mcd_DevNext(McdEntry* out) {
+    while (dev_dir.next < dev_dir.n) {
+        const McdEntry* e = &dev_dir.all[dev_dir.next++];
+        if (!Mcd_NameMatch(dev_dir.pattern, e->name)) continue;
+        *out = *e;
+        return 1;
+    }
+    return 0;
+}
+int Mcd_DevFirst(const char* pattern, McdEntry* out) {
+    const int port = Mcd_DevPort(pattern);
+    const char* path = Mcd_GetPath(port);
+    dev_dir.n = dev_dir.next = 0;
+    if (!path) return 0;
+    const int n = Mcd_List(path, dev_dir.all);
+    if (n < 0) return 0;
+    dev_dir.n = n;
+    dev_dir.port = port;
+    dev_file_name(pattern, dev_dir.pattern);
+    if (!dev_dir.pattern[0]) dev_dir.pattern[0] = '*';
+    return Mcd_DevNext(out);
+}
+int Mcd_DevErase(const char* name) {
+    const char* path = Mcd_GetPath(Mcd_DevPort(name));
+    char fname[MCD_NAME + 1];
+    if (!path) return 0;
+    dev_file_name(name, fname);
+    return Mcd_Delete(path, fname) == MCD_OK;
+}
+int Mcd_DevFormat(const char* name) {
+    const char* path = Mcd_GetPath(Mcd_DevPort(name));
+    return path && Mcd_Format(path) == MCD_OK;
+}

@@ -62,6 +62,31 @@ int Mcd_Write(const char* path, const char* name, uint32_t ofs, const void* buf,
 /* The BIOS's name patterns: '?' matches any one character, '*' the rest. */
 int Mcd_NameMatch(const char* pattern, const char* name);
 
+/*
+ * The BIOS's memory card device ("bu00:" port 1, "bu10:" port 2) on card
+ * images, for code that uses the kernel's file calls: open (FCREAT with the
+ * block count in the high 16 bits makes a file), read, write, lseek, close,
+ * firstfile / nextfile, erase and format. Calls complete before returning.
+ */
+void Mcd_SetPath(int port, const char* path); /* NULL or "": an empty port */
+const char* Mcd_GetPath(int port);
+/* MCD_OK (formatted), MCD_ERR_UNFORMATTED, or MCD_ERR_IO (no card) */
+int Mcd_DevState(int port);
+/* "buX0:" names: the port, or -1 for any other name */
+int Mcd_DevPort(const char* name);
+#define MCD_DEV_FCREAT 0x0200
+int Mcd_DevOpen(const char* name, int flags); /* a descriptor, or -1 */
+int Mcd_DevIsFd(int fd);
+long Mcd_DevRead(int fd, void* buf, long n);
+long Mcd_DevWrite(int fd, const void* buf, long n);
+long Mcd_DevSeek(int fd, long offset, int whence); /* SEEK_SET/CUR/END: the position, or -1 */
+int Mcd_DevClose(int fd);
+/* firstfile("bu00:PATTERN") / nextfile: 1 and the entry, or 0 at the end */
+int Mcd_DevFirst(const char* pattern, McdEntry* out);
+int Mcd_DevNext(McdEntry* out);
+int Mcd_DevErase(const char* name);   /* 1 if the file was deleted */
+int Mcd_DevFormat(const char* name);  /* "bu00:": 1 if formatted */
+
 #ifdef __cplusplus
 }
 #endif
